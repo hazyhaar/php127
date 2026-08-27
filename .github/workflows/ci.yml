@@ -15,18 +15,27 @@ jobs:
         go-version: [ '1.27.x' ]
 
     steps:
-      - name: Checkout Code
+      - name: Checkout php127 Code
         uses: actions/checkout@v4
+
+      - name: Checkout c2simd dependency
+        uses: actions/checkout@v4
+        with:
+          repository: hazyhaar/c2simd
+          path: .c2simd_checkout
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
 
-      - name: Install System Dependencies
+      - name: Install System Dependencies & Setup Paths
         run: |
           sudo apt-get update
           sudo apt-get install -y php-cli
+          mkdir -p ../c2simd
+          cp -r .c2simd_checkout/c2pkg ../c2simd/
+          rm -rf .c2simd_checkout
 
       - name: Execute 7-Gate CI Suite
         run: |
