@@ -687,6 +687,10 @@ func (s *Statement) RowCount() int {
 	return len(s.rows)
 }
 
+func (s *Statement) SelectedCols() []string {
+	return s.selectedCols
+}
+
 func (s *Statement) CloseCursor() {
 	s.rows = nil
 	s.cursor = 0

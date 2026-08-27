@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"code.hazyhaar.fr/devhoros/php127/security"
 	"code.hazyhaar.fr/devhoros/php127/types"
 )
 
@@ -33,6 +34,7 @@ var (
 	httpClient        = &http.Client{
 		Timeout: 30 * time.Second,
 	}
+	defaultSSRFGuard = security.NewSSRFGuard()
 )
 
 const (
@@ -103,6 +105,14 @@ func CurlExec(hVal types.Value) types.Value {
 	curlMu.Unlock()
 
 	if !ok || h.URL == "" {
+		return types.NewBool(false)
+	}
+
+	// Contrôle Anti-SSRF systématique
+	if err := defaultSSRFGuard.InspectURL(h.URL); err != nil {
+		h.LastError = "SSRF violation: destination URL is prohibited"
+		h.LastErrno = 7 // CURLE_COULDNT_CONNECT
+		security.GetTelemetryHub().RecordEvent(security.EventSSRFBlocked, "curl_exec", h.URL, 0, 0)
 		return types.NewBool(false)
 	}
 

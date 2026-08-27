@@ -1119,10 +1119,17 @@ func (c *Compiler) compileCall(n CallExpr) error {
 		return nil
 	}
 
-	// User function call
+	// User function call or Fallback Foreign Call
 	funcIdx, exists := c.funcMap[lower]
 	if !exists {
-		return fmt.Errorf("fonction inconnue: %s", n.Callee)
+		for _, arg := range n.Args {
+			if err := c.compileNode(arg); err != nil {
+				return err
+			}
+		}
+		strIdx := c.addString(n.Callee)
+		c.emit(vm.OpBuiltinCall, 255, uint16(len(n.Args)), strIdx, types.NewNull())
+		return nil
 	}
 
 	for _, arg := range n.Args {

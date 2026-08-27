@@ -6,9 +6,11 @@ package vm
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"code.hazyhaar.fr/devhoros/php127/builtins"
+	"code.hazyhaar.fr/devhoros/php127/foreign"
 	"code.hazyhaar.fr/devhoros/php127/pdo"
 	"code.hazyhaar.fr/devhoros/php127/security"
 	"code.hazyhaar.fr/devhoros/php127/streams"
@@ -233,6 +235,7 @@ type VM struct {
 	Streams       *streams.StreamManager
 	DB            *pdo.MemoryDB
 	SilenceLevel  int
+	ForeignPool   foreign.WorkerPool
 }
 
 func NewVM(out io.Writer) *VM {
@@ -1520,6 +1523,16 @@ func (vm *VM) Execute(prog *BytecodeProgram) (types.Value, error) {
 				if len(args) >= 1 {
 					res = builtins.CurlErrno(args[0])
 				}
+			case 255: // Fallback Foreign Call
+				funcName := ""
+				if int(ins.C) < len(currentProg.StringPool) {
+					funcName = currentProg.StringPool[ins.C]
+				}
+				resVal, err := vm.DispatchFallbackForeignCall(funcName, args)
+				if err != nil {
+					return types.NewNull(), err
+				}
+				res = resVal
 			}
 
 			vm.Push(res)
@@ -1646,7 +1659,7 @@ func (vm *VM) allocObjectIdxByName(name string) int {
 	return objIdx
 }
 
-func (vm *VM) newArrayFromRow(row pdo.TableRow) types.Value {
+func (vm *VM) newArrayFromRow(row pdo.TableRow, selectedCols []string) types.Value {
 	if vm.NextTable < len(vm.SwissTables) {
 		tIdx := vm.NextTable
 		vm.NextTable++
@@ -1659,12 +1672,24 @@ func (vm *VM) newArrayFromRow(row pdo.TableRow) types.Value {
 			64,
 			64,
 		)
+		var orderedCols []string
+		if len(selectedCols) > 0 {
+			orderedCols = selectedCols
+		} else {
+			for k := range row {
+				orderedCols = append(orderedCols, k)
+			}
+			sort.Strings(orderedCols)
+		}
+
 		idx := int64(0)
-		for _, v := range row {
-			if idx < 64 {
-				c2ordered_swiss.Swiss_insert_packed_int(ht, idx, uint32(v.Type), idx)
-				vm.SwissValues[tIdx][idx] = v
-				idx++
+		for _, col := range orderedCols {
+			if v, ok := row[col]; ok {
+				if idx < 64 {
+					c2ordered_swiss.Swiss_insert_packed_int(ht, idx, uint32(v.Type), idx)
+					vm.SwissValues[tIdx][idx] = v
+					idx++
+				}
 			}
 		}
 		return types.Value{
@@ -1676,7 +1701,7 @@ func (vm *VM) newArrayFromRow(row pdo.TableRow) types.Value {
 	return types.NewNull()
 }
 
-func (vm *VM) newArrayFromRows(rows []pdo.TableRow) types.Value {
+func (vm *VM) newArrayFromRows(rows []pdo.TableRow, selectedCols []string) types.Value {
 	if vm.NextTable < len(vm.SwissTables) {
 		tIdx := vm.NextTable
 		vm.NextTable++
@@ -1691,7 +1716,7 @@ func (vm *VM) newArrayFromRows(rows []pdo.TableRow) types.Value {
 		)
 		for i, r := range rows {
 			if i < 64 {
-				rArr := vm.newArrayFromRow(r)
+				rArr := vm.newArrayFromRow(r, selectedCols)
 				c2ordered_swiss.Swiss_insert_packed_int(ht, int64(i), uint32(rArr.Type), int64(i))
 				vm.SwissValues[tIdx][i] = rArr
 			}
@@ -1811,11 +1836,11 @@ func (vm *VM) dispatchNativeMethod(obj *ObjectInstance, funcIdx int, targetIdx i
 			if !found {
 				return types.NewBool(false)
 			}
-			return vm.newArrayFromRow(row)
+			return vm.newArrayFromRow(row, stmt.SelectedCols())
 
 		case "fetchall":
 			rows := stmt.FetchAll()
-			return vm.newArrayFromRows(rows)
+			return vm.newArrayFromRows(rows, stmt.SelectedCols())
 
 		case "fetchcolumn":
 			col := 0
@@ -1844,4 +1869,33 @@ func (vm *VM) dispatchNativeMethod(obj *ObjectInstance, funcIdx int, targetIdx i
 	}
 
 	return types.NewNull()
+}
+
+// DispatchFallbackForeignCall gère la délégation sécurisée des fonctions PHP externes
+func (vm *VM) DispatchFallbackForeignCall(funcName string, args []types.Value) (types.Value, error) {
+	// 1. Gate d'entrée : Vérification de sécurité (Taint & Puits sensibles)
+	if vm.Guard != nil {
+		if err := vm.Guard.CheckForeignSink(funcName, args); err != nil {
+			return types.NewNull(), err
+		}
+	}
+
+	if vm.ForeignPool == nil {
+		vm.ForeignPool = foreign.NewMockWorkerPool()
+	}
+
+	// 2. Exécution dans le pool externe
+	resVal, err := vm.ForeignPool.Call(funcName, args)
+	if err != nil {
+		return types.NewNull(), err
+	}
+
+	// 3. Gate de sortie : Egress Inspect sur données renvoyées
+	if vm.Guard != nil && resVal.Type == types.TypeString {
+		if err := vm.Guard.EgressInspect(resVal.Bytes()); err != nil {
+			return types.NewNull(), err
+		}
+	}
+
+	return resVal, nil
 }
