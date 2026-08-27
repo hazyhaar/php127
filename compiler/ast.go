@@ -105,6 +105,11 @@ type StaticPropertyExpr struct {
 	Property  string
 }
 
+type ClassConstExpr struct {
+	ClassName string
+	ConstName string
+}
+
 type InstanceOfExpr struct {
 	Target    Node
 	ClassName string
@@ -330,6 +335,7 @@ func (e MethodCallExpr) isNode()     {}
 func (e PropertyAccessExpr) isNode() {}
 func (e StaticCallExpr) isNode()     {}
 func (e StaticPropertyExpr) isNode() {}
+func (e ClassConstExpr) isNode()     {}
 func (e InstanceOfExpr) isNode()     {}
 func (e IncludeExpr) isNode()        {}
 func (e ClosureExpr) isNode()        {}

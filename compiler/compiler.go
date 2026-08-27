@@ -49,6 +49,8 @@ func Compile(src string) (*vm.BytecodeProgram, error) {
 }
 
 func (c *Compiler) CompileAST(stmts []Node) (*vm.BytecodeProgram, error) {
+	c.registerBuiltinClasses()
+
 	// First pass: collect class declarations
 	for _, stmt := range stmts {
 		if cDecl, ok := stmt.(ClassDeclStmt); ok {
@@ -117,6 +119,36 @@ func (c *Compiler) CompileAST(stmts []Node) (*vm.BytecodeProgram, error) {
 			fIdx := uint16(len(c.functions))
 			c.funcMap[strings.ToLower(fDecl.Name)] = fIdx
 			c.functions = append(c.functions, vm.BytecodeProgram{})
+		}
+	}
+
+	// First pass (b): Inherit methods from parent classes & flatten traits
+	for _, stmt := range stmts {
+		if cDecl, ok := stmt.(ClassDeclStmt); ok {
+			clsIdx := c.classMap[strings.ToLower(cDecl.Name)]
+			clsDef := &c.classes[clsIdx]
+
+			if cDecl.Parent != "" {
+				if pIdx, ok := c.classMap[strings.ToLower(cDecl.Parent)]; ok {
+					parentDef := c.classes[pIdx]
+					for mName, fIdx := range parentDef.Methods {
+						if _, overridden := clsDef.Methods[mName]; !overridden {
+							clsDef.Methods[mName] = fIdx
+						}
+					}
+				}
+			}
+
+			for _, tName := range cDecl.Traits {
+				if tIdx, ok := c.classMap[strings.ToLower(tName)]; ok {
+					traitDef := c.classes[tIdx]
+					for mName, fIdx := range traitDef.Methods {
+						if _, overridden := clsDef.Methods[mName]; !overridden {
+							clsDef.Methods[mName] = fIdx
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -190,30 +222,6 @@ func (c *Compiler) CompileAST(stmts []Node) (*vm.BytecodeProgram, error) {
 					ClassMap:          c.classMap,
 					ExceptionHandlers: subCompiler.exceptionHandlers,
 					NumVars:           subCompiler.nextVar,
-				}
-			}
-
-			// Inherit methods from parent class (VTable inheritance)
-			if cDecl.Parent != "" {
-				if pIdx, ok := c.classMap[strings.ToLower(cDecl.Parent)]; ok {
-					parentDef := c.classes[pIdx]
-					for mName, fIdx := range parentDef.Methods {
-						if _, overridden := clsDef.Methods[mName]; !overridden {
-							clsDef.Methods[mName] = fIdx
-						}
-					}
-				}
-			}
-
-			// Flatten traits into class
-			for _, tName := range cDecl.Traits {
-				if tIdx, ok := c.classMap[strings.ToLower(tName)]; ok {
-					traitDef := c.classes[tIdx]
-					for mName, fIdx := range traitDef.Methods {
-						if _, overridden := clsDef.Methods[mName]; !overridden {
-							clsDef.Methods[mName] = fIdx
-						}
-					}
 				}
 			}
 		}
@@ -412,6 +420,24 @@ func (c *Compiler) compileNode(node Node) error {
 		}
 		strIdx := c.addString(n.ClassName)
 		c.emit(vm.OpInstanceOf, strIdx, 0, 0, types.NewNull())
+
+	case ClassConstExpr:
+		clsLower := strings.ToLower(n.ClassName)
+		if clsIdx, ok := c.classMap[clsLower]; ok {
+			cls := c.classes[clsIdx]
+			if cls.Constants != nil {
+				if val, found := cls.Constants[n.ConstName]; found {
+					c.emit(vm.OpLoadConst, 0, 0, 0, val)
+					return nil
+				}
+			}
+			constStrIdx := c.addString(n.ConstName)
+			c.emit(vm.OpGetConst, clsIdx, constStrIdx, 0, types.NewNull())
+			return nil
+		}
+		c.emit(vm.OpLoadConst, 0, 0, 0, types.NewNull())
+		return nil
+
 	case IntLitExpr:
 		c.emit(vm.OpLoadConst, 0, 0, 0, types.NewLong(n.Val))
 
@@ -460,6 +486,14 @@ func (c *Compiler) compileNode(node Node) error {
 		}
 
 	case UnaryExpr:
+		if n.Op == TokAt {
+			c.emit(vm.OpSilenceBegin, 0, 0, 0, types.NewNull())
+			if err := c.compileNode(n.Expr); err != nil {
+				return err
+			}
+			c.emit(vm.OpSilenceEnd, 0, 0, 0, types.NewNull())
+			return nil
+		}
 		if err := c.compileNode(n.Expr); err != nil {
 			return err
 		}
@@ -1323,4 +1357,92 @@ func (c *Compiler) compileClosure(params []string, uses []string, body []Node) e
 	// Pushes closure function index as a callable Long/Object
 	c.emit(vm.OpLoadConst, 0, 0, 0, types.NewLong(int64(fIdx)))
 	return nil
+}
+
+func (c *Compiler) registerBuiltinClasses() {
+	builtins := []struct {
+		name       string
+		parent     string
+		implements []string
+		methods    []string
+		props      []string
+		constants  map[string]types.Value
+	}{
+		{name: "Throwable", parent: "", methods: []string{"getMessage", "getCode", "getFile", "getLine", "getTraceAsString"}},
+		{name: "Exception", parent: "", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage", "getCode"}},
+		{name: "RuntimeException", parent: "Exception", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "LogicException", parent: "Exception", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "InvalidArgumentException", parent: "LogicException", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "PDOException", parent: "RuntimeException", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "Error", parent: "", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage", "getCode"}},
+		{name: "TypeError", parent: "Error", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "ValueError", parent: "Error", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "DivisionByZeroError", parent: "Error", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "ParseError", parent: "Error", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "ArithmeticError", parent: "Error", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{name: "UnhandledMatchError", parent: "Error", implements: []string{"Throwable"}, props: []string{"message", "code", "file", "line"}, methods: []string{"__construct", "getMessage"}},
+		{
+			name:   "PDO",
+			parent: "",
+			props:  []string{"_pdo_id", "dsn"},
+			constants: map[string]types.Value{
+				"ATTR_ERRMODE":            types.NewLong(1),
+				"ATTR_DEFAULT_FETCH_MODE": types.NewLong(19),
+				"ERRMODE_SILENT":          types.NewLong(0),
+				"ERRMODE_WARNING":         types.NewLong(1),
+				"ERRMODE_EXCEPTION":       types.NewLong(2),
+				"FETCH_ASSOC":             types.NewLong(2),
+				"FETCH_NUM":               types.NewLong(3),
+				"FETCH_BOTH":              types.NewLong(4),
+				"FETCH_OBJ":               types.NewLong(5),
+				"FETCH_COLUMN":            types.NewLong(7),
+			},
+			methods: []string{"__construct", "exec", "query", "prepare", "beginTransaction", "commit", "rollBack", "inTransaction", "lastInsertId", "setAttribute", "getAttribute"},
+		},
+		{
+			name:    "PDOStatement",
+			parent:  "",
+			props:   []string{"_stmt_id", "queryString"},
+			methods: []string{"execute", "fetch", "fetchAll", "fetchColumn", "rowCount", "bindValue", "closeCursor"},
+		},
+	}
+
+	for _, b := range builtins {
+		nameLower := strings.ToLower(b.name)
+		if _, exists := c.classMap[nameLower]; exists {
+			continue
+		}
+		clsIdx := uint16(len(c.classes))
+		c.classMap[nameLower] = clsIdx
+
+		clsDef := vm.ClassDef{
+			Name:        b.name,
+			Parent:      b.parent,
+			Implements:  b.implements,
+			Methods:     make(map[string]uint16),
+			Constants:   b.constants,
+			PropOffsets: make(map[string]int),
+		}
+
+		for _, pName := range b.props {
+			pOffset := len(clsDef.PropNames)
+			clsDef.PropNames = append(clsDef.PropNames, pName)
+			clsDef.PropOffsets[pName] = pOffset
+			clsDef.PropDefaults = append(clsDef.PropDefaults, types.NewNull())
+		}
+
+		for _, mName := range b.methods {
+			mFuncIdx := uint16(len(c.functions))
+			mNameLower := strings.ToLower(mName)
+			clsDef.Methods[mNameLower] = mFuncIdx
+			c.funcMap[nameLower+"::"+mNameLower] = mFuncIdx
+			c.functions = append(c.functions, vm.BytecodeProgram{
+				Instructions: []vm.Instruction{
+					{Op: vm.OpRetFrame, Const: types.NewNull()},
+				},
+			})
+		}
+
+		c.classes = append(c.classes, clsDef)
+	}
 }

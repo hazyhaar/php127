@@ -116,6 +116,10 @@ const (
 	OpEcho
 	OpPrint
 	OpReturn
+
+	// Opérateur de silence @
+	OpSilenceBegin
+	OpSilenceEnd
 )
 
 type Instruction struct {
@@ -228,6 +232,7 @@ type VM struct {
 	OutputBuffers [][]byte
 	Streams       *streams.StreamManager
 	DB            *pdo.MemoryDB
+	SilenceLevel  int
 }
 
 func NewVM(out io.Writer) *VM {
@@ -273,6 +278,7 @@ func (vm *VM) Reset() {
 		vm.Objects[i] = ObjectInstance{}
 	}
 	vm.OutputBuffers = vm.OutputBuffers[:0]
+	vm.SilenceLevel = 0
 }
 
 func (vm *VM) Push(v types.Value) {
@@ -972,6 +978,31 @@ func (vm *VM) Execute(prog *BytecodeProgram) (types.Value, error) {
 				}
 				objVal := types.Value{Type: types.TypeObject, Data: int64(objIdx)}
 
+				// Instanciation spéciale PDO
+				if cls.Name == "PDO" {
+					dsnStr := ""
+					userStr := ""
+					passStr := ""
+					if numArgs >= 1 {
+						dsnStr = vm.Stack[vm.SP-int(numArgs)].String()
+					}
+					if numArgs >= 2 {
+						userStr = vm.Stack[vm.SP-int(numArgs)+1].String()
+					}
+					if numArgs >= 3 {
+						passStr = vm.Stack[vm.SP-int(numArgs)+2].String()
+					}
+					p, _ := pdo.NewPDO(dsnStr, userStr, passStr, nil)
+					if p != nil {
+						pId := pdo.RegisterPDOInstance(p)
+						obj.Props[0] = types.NewLong(pId)
+					}
+					vm.SP -= int(numArgs)
+					vm.Push(objVal)
+					pc++
+					continue
+				}
+
 				// Si constructeur présent
 				if ctorIdx, ok := cls.Methods["__construct"]; ok && int(ctorIdx) < len(vm.Functions) {
 					calleeProg := &vm.Functions[ctorIdx]
@@ -1050,22 +1081,34 @@ func (vm *VM) Execute(prog *BytecodeProgram) (types.Value, error) {
 			targetIdx := vm.SP - int(numArgs) - 1
 			if targetIdx >= 0 {
 				target := vm.Stack[targetIdx]
-				if target.Type == types.TypeObject && int(target.Data) < len(vm.Objects) && funcIdx < len(vm.Functions) {
-					calleeProg := &vm.Functions[funcIdx]
-					frame := CallFrame{
-						ReturnPC: pc + 1,
-						BaseSP:   targetIdx,
-						BaseVar:  (vm.FP + 1) * 32,
-						NumArgs:  numArgs + 1,
-						Prog:     currentProg,
+				if target.Type == types.TypeObject && int(target.Data) < len(vm.Objects) {
+					obj := &vm.Objects[target.Data]
+					if vm.isNativeClass(obj.ClassName) {
+						resVal := vm.dispatchNativeMethod(obj, funcIdx, targetIdx, int(numArgs))
+						vm.SP = targetIdx
+						vm.Push(resVal)
+						pc++
+						continue
 					}
-					vm.Frames[vm.FP] = frame
-					vm.FP++
-					// $this dans slot 0
-					vm.Vars[frame.BaseVar] = target
-					currentProg = calleeProg
-					pc = 0
-				} else if isNullsafe {
+					if funcIdx < len(vm.Functions) {
+						calleeProg := &vm.Functions[funcIdx]
+						frame := CallFrame{
+							ReturnPC: pc + 1,
+							BaseSP:   targetIdx,
+							BaseVar:  (vm.FP + 1) * 32,
+							NumArgs:  numArgs + 1,
+							Prog:     currentProg,
+						}
+						vm.Frames[vm.FP] = frame
+						vm.FP++
+						// $this dans slot 0
+						vm.Vars[frame.BaseVar] = target
+						currentProg = calleeProg
+						pc = 0
+						continue
+					}
+				}
+				if isNullsafe {
 					vm.SP = targetIdx
 					vm.Push(types.NewNull())
 					pc++
@@ -1542,6 +1585,16 @@ func (vm *VM) Execute(prog *BytecodeProgram) (types.Value, error) {
 			}
 			pc++
 
+		case OpSilenceBegin:
+			vm.SilenceLevel++
+			pc++
+
+		case OpSilenceEnd:
+			if vm.SilenceLevel > 0 {
+				vm.SilenceLevel--
+			}
+			pc++
+
 		case OpReturn:
 			if vm.SP > 0 {
 				return vm.Pop(), nil
@@ -1557,4 +1610,238 @@ func (vm *VM) Execute(prog *BytecodeProgram) (types.Value, error) {
 		return vm.Pop(), nil
 	}
 	return types.NewNull(), nil
+}
+
+func (vm *VM) isNativeClass(name string) bool {
+	return strings.EqualFold(name, "PDO") || strings.EqualFold(name, "PDOStatement")
+}
+
+func (vm *VM) allocObjectIdxByName(name string) int {
+	clsLower := strings.ToLower(name)
+	clsIdx := 0
+	if idx, ok := vm.ClassMap[clsLower]; ok {
+		clsIdx = int(idx)
+	}
+	if vm.NextObject >= len(vm.Objects) {
+		newObjects := make([]ObjectInstance, len(vm.Objects)*2)
+		copy(newObjects, vm.Objects)
+		vm.Objects = newObjects
+	}
+	objIdx := vm.NextObject
+	vm.NextObject++
+	obj := &vm.Objects[objIdx]
+	obj.ClassIdx = uint16(clsIdx)
+	obj.ClassName = name
+	if clsIdx < len(vm.Classes) {
+		cls := &vm.Classes[clsIdx]
+		if len(cls.PropDefaults) > len(obj.PropsBuf) {
+			obj.Props = make([]types.Value, len(cls.PropDefaults))
+		} else {
+			obj.Props = obj.PropsBuf[:len(cls.PropDefaults)]
+		}
+		for pIdx, defVal := range cls.PropDefaults {
+			obj.Props[pIdx] = defVal
+		}
+	}
+	return objIdx
+}
+
+func (vm *VM) newArrayFromRow(row pdo.TableRow) types.Value {
+	if vm.NextTable < len(vm.SwissTables) {
+		tIdx := vm.NextTable
+		vm.NextTable++
+		ht := &vm.SwissTables[tIdx]
+		c2ordered_swiss.Swiss_init(
+			ht,
+			vm.SwissCtrl[tIdx][:],
+			vm.SwissSlots[tIdx][:],
+			vm.SwissElems[tIdx][:],
+			64,
+			64,
+		)
+		idx := int64(0)
+		for _, v := range row {
+			if idx < 64 {
+				c2ordered_swiss.Swiss_insert_packed_int(ht, idx, uint32(v.Type), idx)
+				vm.SwissValues[tIdx][idx] = v
+				idx++
+			}
+		}
+		return types.Value{
+			Type: types.TypeArray,
+			Data: int64(tIdx),
+			Len:  ht.N_elements,
+		}
+	}
+	return types.NewNull()
+}
+
+func (vm *VM) newArrayFromRows(rows []pdo.TableRow) types.Value {
+	if vm.NextTable < len(vm.SwissTables) {
+		tIdx := vm.NextTable
+		vm.NextTable++
+		ht := &vm.SwissTables[tIdx]
+		c2ordered_swiss.Swiss_init(
+			ht,
+			vm.SwissCtrl[tIdx][:],
+			vm.SwissSlots[tIdx][:],
+			vm.SwissElems[tIdx][:],
+			64,
+			64,
+		)
+		for i, r := range rows {
+			if i < 64 {
+				rArr := vm.newArrayFromRow(r)
+				c2ordered_swiss.Swiss_insert_packed_int(ht, int64(i), uint32(rArr.Type), int64(i))
+				vm.SwissValues[tIdx][i] = rArr
+			}
+		}
+		return types.Value{
+			Type: types.TypeArray,
+			Data: int64(tIdx),
+			Len:  ht.N_elements,
+		}
+	}
+	return types.NewNull()
+}
+
+func (vm *VM) dispatchNativeMethod(obj *ObjectInstance, funcIdx int, targetIdx int, numArgs int) types.Value {
+	args := make([]types.Value, numArgs)
+	for i := 0; i < numArgs; i++ {
+		args[i] = vm.Stack[targetIdx+1+i]
+	}
+
+	cls := vm.Classes[obj.ClassIdx]
+	var methodName string
+	for mName, fIdx := range cls.Methods {
+		if int(fIdx) == funcIdx {
+			methodName = mName
+			break
+		}
+	}
+
+	if strings.EqualFold(obj.ClassName, "PDO") {
+		pId := obj.Props[0].ToLong()
+		p, ok := pdo.GetPDOInstance(pId)
+		if !ok || p == nil {
+			return types.NewNull()
+		}
+
+		switch strings.ToLower(methodName) {
+		case "exec":
+			if len(args) > 0 {
+				n, _ := p.Exec(args[0].String(), args[1:]...)
+				return types.NewLong(n)
+			}
+		case "query":
+			if len(args) > 0 {
+				stmt, err := p.Query(args[0].String(), args[1:]...)
+				if err != nil || stmt == nil {
+					return types.NewBool(false)
+				}
+				sId := pdo.RegisterStmtInstance(stmt)
+				stmtObjIdx := vm.allocObjectIdxByName("PDOStatement")
+				vm.Objects[stmtObjIdx].Props[0] = types.NewLong(sId)
+				return types.Value{Type: types.TypeObject, Data: int64(stmtObjIdx)}
+			}
+		case "prepare":
+			if len(args) > 0 {
+				stmt, err := p.Prepare(args[0].String())
+				if err != nil || stmt == nil {
+					return types.NewBool(false)
+				}
+				sId := pdo.RegisterStmtInstance(stmt)
+				stmtObjIdx := vm.allocObjectIdxByName("PDOStatement")
+				vm.Objects[stmtObjIdx].Props[0] = types.NewLong(sId)
+				return types.Value{Type: types.TypeObject, Data: int64(stmtObjIdx)}
+			}
+		case "begintransaction":
+			_ = p.BeginTransaction()
+			return types.NewBool(true)
+		case "commit":
+			_ = p.Commit()
+			return types.NewBool(true)
+		case "rollback":
+			_ = p.RollBack()
+			return types.NewBool(true)
+		case "intransaction":
+			return types.NewBool(p.InTransaction())
+		case "lastinsertid":
+			return types.NewLong(p.LastInsertId())
+		case "setattribute":
+			if len(args) >= 2 {
+				p.SetAttribute(int(args[0].ToLong()), args[1])
+				return types.NewBool(true)
+			}
+		case "getattribute":
+			if len(args) >= 1 {
+				return p.GetAttribute(int(args[0].ToLong()))
+			}
+		}
+	}
+
+	if strings.EqualFold(obj.ClassName, "PDOStatement") {
+		sId := obj.Props[0].ToLong()
+		stmt, ok := pdo.GetStmtInstance(sId)
+		if !ok || stmt == nil {
+			return types.NewNull()
+		}
+
+		switch strings.ToLower(methodName) {
+		case "execute":
+			var execArgs []types.Value
+			if len(args) > 0 {
+				if args[0].Type == types.TypeArray {
+					tIdx := int(args[0].Data)
+					if tIdx < len(vm.SwissTables) {
+						ht := &vm.SwissTables[tIdx]
+						for i := 0; i < int(ht.N_elements); i++ {
+							execArgs = append(execArgs, vm.SwissValues[tIdx][i])
+						}
+					}
+				} else {
+					execArgs = args
+				}
+			}
+			ok, _ := stmt.Execute(execArgs)
+			return types.NewBool(ok)
+
+		case "fetch":
+			row, found := stmt.Fetch()
+			if !found {
+				return types.NewBool(false)
+			}
+			return vm.newArrayFromRow(row)
+
+		case "fetchall":
+			rows := stmt.FetchAll()
+			return vm.newArrayFromRows(rows)
+
+		case "fetchcolumn":
+			col := 0
+			if len(args) > 0 {
+				col = int(args[0].ToLong())
+			}
+			val, found := stmt.FetchColumn(col)
+			if !found {
+				return types.NewBool(false)
+			}
+			return val
+
+		case "rowcount":
+			return types.NewLong(int64(stmt.RowCount()))
+
+		case "bindvalue":
+			if len(args) >= 2 {
+				stmt.BindValue(args[0].String(), args[1])
+				return types.NewBool(true)
+			}
+
+		case "closecursor":
+			stmt.CloseCursor()
+			return types.NewBool(true)
+		}
+	}
+
+	return types.NewNull()
 }

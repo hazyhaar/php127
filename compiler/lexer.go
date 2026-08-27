@@ -126,6 +126,7 @@ const (
 	TokComma     // ,
 	TokBackslash // \
 	TokAttrStart // #[
+	TokAt        // @
 )
 
 type Token struct {
@@ -377,6 +378,8 @@ func (l *Lexer) NextToken() Token {
 		return Token{Type: TokComma, Lexeme: ",", Line: startLine, Col: startCol}
 	case '\\':
 		return Token{Type: TokBackslash, Lexeme: "\\", Line: startLine, Col: startCol}
+	case '@':
+		return Token{Type: TokAt, Lexeme: "@", Line: startLine, Col: startCol}
 	case '#':
 		if l.peek() == '[' {
 			l.pos++

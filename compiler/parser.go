@@ -1094,7 +1094,7 @@ func (p *Parser) parsePrimary() Node {
 		p.expect(TokRParen)
 		node = expr
 
-	case TokPlus, TokMinus, TokNot, TokBitNot:
+	case TokPlus, TokMinus, TokNot, TokBitNot, TokAt:
 		op := p.curTok.Type
 		p.nextToken()
 		sub := p.parsePrimary()
@@ -1156,25 +1156,29 @@ func (p *Parser) parsePrimary() Node {
 				p.nextToken()
 				node = StaticPropertyExpr{ClassName: className, Property: prop}
 			} else {
-				method := p.curTok.Lexeme
+				ident := p.curTok.Lexeme
 				p.expect(TokIdent)
-				p.expect(TokLParen)
-				var args []Node
-				if p.curTok.Type != TokRParen {
-					for {
-						arg := p.parseExpression(0)
-						if arg != nil {
-							args = append(args, arg)
-						}
-						if p.curTok.Type == TokComma {
-							p.nextToken()
-						} else {
-							break
+				if p.curTok.Type == TokLParen {
+					p.expect(TokLParen)
+					var args []Node
+					if p.curTok.Type != TokRParen {
+						for {
+							arg := p.parseExpression(0)
+							if arg != nil {
+								args = append(args, arg)
+							}
+							if p.curTok.Type == TokComma {
+								p.nextToken()
+							} else {
+								break
+							}
 						}
 					}
+					p.expect(TokRParen)
+					node = StaticCallExpr{ClassName: className, Method: ident, Args: args}
+				} else {
+					node = ClassConstExpr{ClassName: className, ConstName: ident}
 				}
-				p.expect(TokRParen)
-				node = StaticCallExpr{ClassName: className, Method: method, Args: args}
 			}
 		} else if p.curTok.Type == TokInstanceOf {
 			p.nextToken() // skip instanceof

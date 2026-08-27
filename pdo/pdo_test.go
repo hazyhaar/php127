@@ -86,3 +86,83 @@ func TestPDOTransactionsRollback(t *testing.T) {
 		t.Fatalf("Attendu 1 ligne après rollback, got: %d", len(rows))
 	}
 }
+
+func TestPDOMultiDriverAndOOPInterface(t *testing.T) {
+	// 1. Test DSNs for SQLite, MySQL, and PostgreSQL
+	dsns := []string{
+		"sqlite::memory:",
+		"mysql:host=127.0.0.1;port=3306;dbname=production",
+		"pgsql:host=localhost;port=5432;dbname=app_db;sslmode=disable",
+		"memory:instance_1",
+	}
+
+	for _, dsn := range dsns {
+		p, err := NewPDO(dsn, "user", "secret", nil)
+		if err != nil {
+			t.Fatalf("Erreur NewPDO(%s): %v", dsn, err)
+		}
+
+		if p.GetAttribute(ATTR_ERRMODE).ToLong() != ERRMODE_EXCEPTION {
+			t.Fatalf("Attribut ATTR_ERRMODE attendu ERRMODE_EXCEPTION, got: %v", p.GetAttribute(ATTR_ERRMODE))
+		}
+
+		// Create table
+		_, err = p.Exec("CREATE TABLE products (sku, name, price)")
+		if err != nil {
+			t.Fatalf("Exec CREATE TABLE sur %s: %v", dsn, err)
+		}
+
+		// Prepare & Execute
+		stmt, err := p.Prepare("INSERT INTO products (sku, name, price) VALUES (?, ?, ?)")
+		if err != nil {
+			t.Fatalf("Prepare sur %s: %v", dsn, err)
+		}
+
+		ok, err := stmt.Execute([]types.Value{
+			types.NewString("SKU-1001"),
+			types.NewString("Go Compiler Book"),
+			types.NewDouble(49.99),
+		})
+		if !ok || err != nil {
+			t.Fatalf("Execute INSERT sur %s: %v", dsn, err)
+		}
+
+		// Query
+		qStmt, err := p.Query("SELECT sku, name, price FROM products WHERE sku = ?", types.NewString("SKU-1001"))
+		if err != nil {
+			t.Fatalf("Query sur %s: %v", dsn, err)
+		}
+
+		row, found := qStmt.Fetch()
+		if !found || row["name"].String() != "Go Compiler Book" {
+			t.Fatalf("Row query inattendue sur %s: %v", dsn, row)
+		}
+
+		// FetchColumn
+		qStmt2, err := p.Query("SELECT sku, name FROM products WHERE sku = ?", types.NewString("SKU-1001"))
+		if err != nil {
+			t.Fatalf("Query 2 sur %s: %v", dsn, err)
+		}
+		colVal, colFound := qStmt2.FetchColumn(0)
+		if !colFound || colVal.String() != "SKU-1001" {
+			t.Fatalf("FetchColumn inattendu sur %s: %v", dsn, colVal)
+		}
+	}
+}
+
+func TestPgsqlPlaceholderRewriting(t *testing.T) {
+	sql := "SELECT * FROM users WHERE email = ? AND role = ? AND age >= ?"
+	rewritten := RewritePgsqlPlaceholders(sql)
+	expected := "SELECT * FROM users WHERE email = $1 AND role = $2 AND age >= $3"
+	if rewritten != expected {
+		t.Fatalf("Réécriture pgsql inattendue:\nAttendu: %s\nObtenu:  %s", expected, rewritten)
+	}
+
+	// Inside quotes: ? must not be rewritten
+	sqlQuoted := "SELECT * FROM logs WHERE msg = 'What ?' AND level = ?"
+	rewrittenQuoted := RewritePgsqlPlaceholders(sqlQuoted)
+	expectedQuoted := "SELECT * FROM logs WHERE msg = 'What ?' AND level = $1"
+	if rewrittenQuoted != expectedQuoted {
+		t.Fatalf("Réécriture pgsql avec quotes inattendue:\nAttendu: %s\nObtenu:  %s", expectedQuoted, rewrittenQuoted)
+	}
+}
