@@ -1,80 +1,72 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-// php127/security: Détection et neutralisation des attaques SSRF (Server-Side Request Forgery)
+// php127/security: Bouclier Anti-SSRF Déterministe (RFC 1918, Link-Local, Cloud Metadata & Obfuscations)
 
 package security
 
 import (
-	"errors"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
 )
 
-var (
-	ErrSecuritySSRFViolation = errors.New("security: tentative d'accès à une ressource réseau interne/interdite (SSRF Blocked)")
-)
-
-// SSRFGuard gère les règles de filtrage des requêtes sortantes (cURL, file_get_contents, fsockopen)
 type SSRFGuard struct {
-	AllowedSchemes []string
-	AllowedHosts   []string
 	BlockedIPNets  []*net.IPNet
+	AllowedSchemes []string
 }
 
 func NewSSRFGuard() *SSRFGuard {
 	sg := &SSRFGuard{
 		AllowedSchemes: []string{"http", "https"},
 	}
-	sg.initDefaultBlockedNets()
-	return sg
-}
 
-func (sg *SSRFGuard) initDefaultBlockedNets() {
-	blockedCIDRs := []string{
-		"127.0.0.0/8",          // Loopback IPv4
-		"10.0.0.0/8",           // RFC 1918 Private
-		"172.16.0.0/12",        // RFC 1918 Private
-		"192.168.0.0/16",       // RFC 1918 Private
-		"169.254.0.0/16",       // Link-Local / Cloud Metadata (AWS/GCP/Azure)
-		"100.64.0.0/10",        // CGNAT
-		"0.0.0.0/8",            // "This" network
-		"224.0.0.0/4",          // Multicast
-		"240.0.0.0/4",          // Reserved
-		"::1/128",              // Loopback IPv6
-		"fc00::/7",             // Unique Local Address IPv6 (ULA)
-		"fe80::/10",            // Link-Local IPv6
-		"::ffff:0:0/96",        // IPv4-mapped IPv6
-		"::ffff:127.0.0.1/128", // IPv4-mapped loopback
+	// CIDRs prohibés : RFC 1918, Loopback, Link-Local, CGNAT, Cloud Metadata
+	cidrs := []string{
+		"127.0.0.0/8",    // Loopback IPv4
+		"10.0.0.0/8",     // RFC 1918 Privé
+		"172.16.0.0/12",  // RFC 1918 Privé
+		"192.168.0.0/16", // RFC 1918 Privé
+		"169.254.0.0/16", // Link-Local & AWS/GCP/Azure Metadata (169.254.169.254)
+		"100.64.0.0/10",  // CGNAT (RFC 6598)
+		"0.0.0.0/8",      // "This host on this network"
+		"224.0.0.0/4",    // Multicast
+		"240.0.0.0/4",    // Reserved
+		"::1/128",        // Loopback IPv6
+		"::/128",         // Unspecified IPv6
+		"fe80::/10",      // Link-Local IPv6
+		"fc00::/7",       // Unique Local IPv6 (ULA)
+		"::ffff:0:0/96",  // IPv4-mapped IPv6
+		"64:ff9b::/96",   // IPv4/IPv6 translation
 	}
 
-	for _, cidr := range blockedCIDRs {
+	for _, cidr := range cidrs {
 		_, ipNet, err := net.ParseCIDR(cidr)
-		if err == nil && ipNet != nil {
+		if err == nil {
 			sg.BlockedIPNets = append(sg.BlockedIPNets, ipNet)
 		}
 	}
+
+	return sg
 }
 
-// InspectURL analyse une URL cible et bloque toute tentative SSRF
-func (sg *SSRFGuard) InspectURL(targetURL string) error {
-	trimmed := strings.TrimSpace(targetURL)
-	if trimmed == "" {
-		return nil
+// InspectURL valide une URL et bloque toute destination privée ou masquée
+func (sg *SSRFGuard) InspectURL(rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ErrSecuritySSRFViolation
 	}
 
-	// Normalisation et gestion des préfixes et encodages
-	parsed, err := url.Parse(trimmed)
+	// Parsing URL
+	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return ErrSecuritySSRFViolation
 	}
 
-	// Vérification du schéma
-	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "" {
+	// Vérification du protocole / scheme
+	if sg.AllowedSchemes != nil {
 		allowedScheme := false
 		for _, s := range sg.AllowedSchemes {
-			if scheme == s {
+			if strings.EqualFold(parsed.Scheme, s) {
 				allowedScheme = true
 				break
 			}
@@ -100,7 +92,15 @@ func (sg *SSRFGuard) InspectURL(targetURL string) error {
 		return ErrSecuritySSRFViolation
 	}
 
-	// Détection d'adresses IP encodées en décimal (ex: 2130706433 pour 127.0.0.1) ou octal
+	// Détection wildcard DNS services (nip.io, sslip.io, xip.io) ciblant IP privée
+	if strings.Contains(hostname, "127.0.0.1") ||
+		strings.Contains(hostname, "169.254.169.254") ||
+		strings.Contains(hostname, "10.0.") ||
+		strings.Contains(hostname, "192.168.") {
+		return ErrSecuritySSRFViolation
+	}
+
+	// Détection d'adresses IP encodées en format BSD inet_aton (décimal, octal, hex, 1/2/3/4 parties)
 	if ip := parseObfuscatedIP(hostname); ip != nil {
 		if sg.isBlockedIP(ip) {
 			return ErrSecuritySSRFViolation
@@ -133,38 +133,49 @@ func (sg *SSRFGuard) isBlockedIP(ip net.IP) bool {
 	return false
 }
 
-// parseObfuscatedIP prend en charge les formats entiers décimaux (ex: http://2130706433/) ou octaux
-func parseObfuscatedIP(s string) net.IP {
-	// Entier brut (32-bit int)
-	if val, err := strconv.ParseUint(s, 10, 32); err == nil {
-		return net.IPv4(byte(val>>24), byte(val>>16), byte(val>>8), byte(val))
+func parsePart(p string) (uint64, bool) {
+	if strings.HasPrefix(p, "0x") || strings.HasPrefix(p, "0X") {
+		val, err := strconv.ParseUint(p[2:], 16, 64)
+		return val, err == nil
 	}
-	// Hexadécimal brut (0x7f000001)
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		if val, err := strconv.ParseUint(s[2:], 16, 32); err == nil {
+	if strings.HasPrefix(p, "0") && len(p) > 1 {
+		val, err := strconv.ParseUint(p, 8, 64)
+		return val, err == nil
+	}
+	val, err := strconv.ParseUint(p, 10, 64)
+	return val, err == nil
+}
+
+// parseObfuscatedIP prend en charge tous les formats BSD inet_aton (1, 2, 3, 4 parties en décimal/octal/hex)
+func parseObfuscatedIP(s string) net.IP {
+	parts := strings.Split(s, ".")
+	switch len(parts) {
+	case 1:
+		val, ok := parsePart(parts[0])
+		if ok && val <= 0xFFFFFFFF {
 			return net.IPv4(byte(val>>24), byte(val>>16), byte(val>>8), byte(val))
 		}
-	}
-	// Notation octale pointée (ex: 0177.0.0.1)
-	parts := strings.Split(s, ".")
-	if len(parts) == 4 {
-		var octets [4]byte
-		for i, p := range parts {
-			if strings.HasPrefix(p, "0") && len(p) > 1 {
-				val, err := strconv.ParseUint(p, 8, 8)
-				if err != nil {
-					return nil
-				}
-				octets[i] = byte(val)
-			} else {
-				val, err := strconv.ParseUint(p, 10, 8)
-				if err != nil {
-					return nil
-				}
-				octets[i] = byte(val)
-			}
+	case 2:
+		p0, ok0 := parsePart(parts[0])
+		p1, ok1 := parsePart(parts[1])
+		if ok0 && ok1 && p0 <= 0xFF && p1 <= 0xFFFFFF {
+			return net.IPv4(byte(p0), byte(p1>>16), byte(p1>>8), byte(p1))
 		}
-		return net.IPv4(octets[0], octets[1], octets[2], octets[3])
+	case 3:
+		p0, ok0 := parsePart(parts[0])
+		p1, ok1 := parsePart(parts[1])
+		p2, ok2 := parsePart(parts[2])
+		if ok0 && ok1 && ok2 && p0 <= 0xFF && p1 <= 0xFF && p2 <= 0xFFFF {
+			return net.IPv4(byte(p0), byte(p1), byte(p2>>8), byte(p2))
+		}
+	case 4:
+		p0, ok0 := parsePart(parts[0])
+		p1, ok1 := parsePart(parts[1])
+		p2, ok2 := parsePart(parts[2])
+		p3, ok3 := parsePart(parts[3])
+		if ok0 && ok1 && ok2 && ok3 && p0 <= 0xFF && p1 <= 0xFF && p2 <= 0xFF && p3 <= 0xFF {
+			return net.IPv4(byte(p0), byte(p1), byte(p2), byte(p3))
+		}
 	}
 	return nil
 }

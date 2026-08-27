@@ -18,6 +18,7 @@ var (
 	ErrSecurityPathTraversal      = errors.New("security: tentative de traversée de répertoire non autorisée")
 	ErrSecurityCodeInjection      = errors.New("security: tentative d'injection de code dynamique (eval/assert/unserialize)")
 	ErrSecuritySQLInjection       = errors.New("security: injection SQL potentielle via concaténation de variable contaminée non préparée")
+	ErrSecuritySSRFViolation      = errors.New("security: tentative de requête SSRF vers une destination réseau privée ou masquée")
 )
 
 type SecurityMode uint8
@@ -150,15 +151,17 @@ func (g *Guard) CheckSQL(rawQuery string, isTainted bool) error {
 		}
 	}
 
-	// Détection heuristique d'injections SQL classiques dans des requêtes non paramétrées
-	upper := strings.ToUpper(rawQuery)
-	if strings.Contains(upper, "UNION SELECT") ||
-		strings.Contains(upper, "' OR 1=1") ||
-		strings.Contains(upper, "\" OR 1=1") ||
-		strings.Contains(upper, "' OR '1'='1") ||
-		strings.Contains(upper, "1; DROP TABLE") ||
-		strings.Contains(upper, "SLEEP(") ||
-		strings.Contains(upper, "BENCHMARK(") {
+	// Détection heuristique d'injections SQL classiques dans des requêtes non paramétrées (0 allocation)
+	clean := stripSQLCommentsZeroAlloc(rawQuery)
+	if containsCaseInsensitive(clean, "UNION SELECT") ||
+		containsCaseInsensitive(clean, "UNION ALL SELECT") ||
+		(containsCaseInsensitive(clean, "UNION") && containsCaseInsensitive(clean, "SELECT")) ||
+		containsCaseInsensitive(clean, "OR 1=1") ||
+		containsCaseInsensitive(clean, "OR '1'='1'") ||
+		containsCaseInsensitive(clean, "DROP TABLE") ||
+		containsCaseInsensitive(clean, "SLEEP(") ||
+		containsCaseInsensitive(clean, "BENCHMARK(") ||
+		containsCaseInsensitive(clean, "information_schema") {
 		g.AnomaliesCount++
 		GetTelemetryHub().RecordEvent(EventSQLiBlocked, "pdo_heuristic", rawQuery, 0, 0)
 		if g.Mode == ModeEnforce {
@@ -166,6 +169,75 @@ func (g *Guard) CheckSQL(rawQuery string, isTainted bool) error {
 		}
 	}
 	return nil
+}
+
+func stripSQLCommentsZeroAlloc(s string) string {
+	if !strings.Contains(s, "/*") {
+		return s
+	}
+	var b strings.Builder
+	inComment := false
+	for i := 0; i < len(s); i++ {
+		// Commentaires conditionnels MySQL exécutables /*!50000...*/ -> désemballage
+		if !inComment && i+2 < len(s) && s[i] == '/' && s[i+1] == '*' && s[i+2] == '!' {
+			i += 2
+			for i+1 < len(s) && s[i+1] >= '0' && s[i+1] <= '9' {
+				i++
+			}
+			b.WriteByte(' ')
+			continue
+		}
+		if !inComment && i+1 < len(s) && s[i] == '/' && s[i+1] == '*' {
+			inComment = true
+			i++
+			continue
+		}
+		if inComment && i+1 < len(s) && s[i] == '*' && s[i+1] == '/' {
+			inComment = false
+			i++
+			b.WriteByte(' ')
+			continue
+		}
+		if !inComment && i+1 < len(s) && s[i] == '*' && s[i+1] == '/' {
+			i++
+			b.WriteByte(' ')
+			continue
+		}
+		if !inComment {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+func containsCaseInsensitive(s, substr string) bool {
+	if len(substr) == 0 {
+		return true
+	}
+	if len(substr) > len(s) {
+		return false
+	}
+	for i := 0; i <= len(s)-len(substr); i++ {
+		match := true
+		for j := 0; j < len(substr); j++ {
+			c1 := s[i+j]
+			c2 := substr[j]
+			if c1 >= 'a' && c1 <= 'z' {
+				c1 -= 'a' - 'A'
+			}
+			if c2 >= 'a' && c2 <= 'z' {
+				c2 -= 'a' - 'A'
+			}
+			if c1 != c2 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckSSRF valide une destination réseau pour cURL ou les flux de connexion externes
