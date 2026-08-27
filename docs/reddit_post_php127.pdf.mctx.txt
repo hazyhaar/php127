@@ -1,0 +1,69 @@
+CHARTER reddit_post — TECHNICAL POST FOR A REDDIT SUBFORUM
+
+WHAT THIS PROFILE IS FOR AND WHICH FILE IS THE DELIVERABLE
+A post submitted to a technical subforum (r/golang, r/programming, r/rust,
+r/databases...).
+
+THE DELIVERABLE IS THE DOCX. Open it in the word processor, select all, paste
+into Reddit's editor. That path preserves tables. Pasting raw Markdown into the
+editor does NOT: the table syntax collapses into unreadable pipe soup, and the
+post has to be rewritten by hand. This is a house finding, not a preference —
+do not hand over a .md and call it done.
+
+Consequence for the theme: print_light. The docx is read and copied from Word or
+LibreOffice, so black text on white. A dark theme yields grey-on-grey there and
+is unusable.
+
+The .md is kept as the SOURCE — it is what gets recompiled and versioned — and
+the .pdf as a proofreading render. Neither is what goes to Reddit.
+
+MANDATORY OPENING (house convention, see examples/DoWi55_reddit_post.md)
+1. H1 — the working title of the piece.
+2. A line "**Suggested Reddit title:**" followed by the exact title to type into
+   the submission form. Reddit titles carry the whole click decision: state the
+   result and the surprise, no colon-stacked marketing.
+3. A horizontal rule.
+4. One line addressing the subforum, e.g. "Hi r/golang," — never a generic
+   greeting, never a self-introduction.
+
+BODY STRUCTURE
+Short lede (2-4 lines): what the thing is, the headline number, and the promise
+of what follows. Then sections with ## headings. A post that only lists wins
+gets taken apart in the comments; one that shows its dead ends with the
+measurements that killed them gets read. Reserve a section for what did NOT
+work, and place it prominently — often it is the most valuable part.
+Close on the generalisable lesson, not on the product.
+
+EVIDENCE RULES (opposable)
+- Every number is measured, on a named object, at a stated scale. No
+  extrapolation, no "up to", no rounding in the favourable direction.
+- State the baseline AND the after value, with the unit. A bare multiplier
+  without both endpoints is not a measurement.
+- If a figure was later corrected, say so in the post. Readers find errors;
+  admitting one costs a paragraph, hiding one costs the thread.
+- Quote real tool output verbatim in a fenced block when it carries the point
+  better than prose (profiler headers, counters, benchmark lines).
+- Never claim recall, correctness or safety without saying what it was verified
+  against.
+
+TONE
+First person plural or impersonal, past tense for the work, present for the
+conclusions. No hype, no superlatives, no "blazing", no "game changer". No
+emoji — Reddit's own culture punishes it in technical subs and the engine
+forbids it. Do not thank the reader for reading. Do not ask for upvotes.
+Contractions are fine; this is not a paper.
+
+FORMAT CONSTRAINTS
+- GFM source. Tables survive only through the docx paste path (see above).
+- ONE comparison table maximum, at most 6 columns, right-aligned numbers.
+- Fenced code blocks: no language tag needed, keep lines under 80 characters —
+  Reddit does not wrap them, it scrolls.
+- Bold sparingly, for the claim of a paragraph. Never bold a whole sentence.
+- No nested lists deeper than one level; old.reddit renders them badly.
+- Length: 600 to 1200 words. Past that, post a summary and link the full write-up.
+
+FORBIDDEN
+Emoji. Marketing adjectives. Unmeasured claims. Benchmarks without hardware and
+scale. "We rewrote it in X and it got faster" without saying what was actually
+slow. Screenshots of text. Links to a paywall as the only evidence.
+Dark themes on the renders. Handing over the .md as the deliverable.
