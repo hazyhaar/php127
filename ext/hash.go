@@ -5,11 +5,14 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha3"
 	"crypto/sha512"
 	"crypto/subtle"
 	"encoding/hex"
 	"hash"
+	"hash/adler32"
 	"hash/crc32"
+	"hash/fnv"
 	"io"
 	"strings"
 
@@ -23,14 +26,39 @@ type hashAlgo struct {
 	hmac bool
 }
 
+// hashAlgos suit l'ordre de hash_algos() de PHP 8.3, restreint aux algorithmes servis ; hmac marque ceux
+// que hash_hmac_algos() liste. md2, md4, ripemd128/256/320, whirlpool, tiger, snefru, gost, murmur3,
+// xxh128 et haval ne sont pas servis.
 var hashAlgos = [...]hashAlgo{
 	{"md5", md5.New, true},
 	{"sha1", sha1.New, true},
+	{"sha224", sha256.New224, true},
 	{"sha256", sha256.New, true},
 	{"sha384", sha512.New384, true},
+	{"sha512/224", sha512.New512_224, true},
+	{"sha512/256", sha512.New512_256, true},
 	{"sha512", sha512.New, true},
+	{"sha3-224", func() hash.Hash { return sha3.New224() }, true},
+	{"sha3-256", func() hash.Hash { return sha3.New256() }, true},
+	{"sha3-384", func() hash.Hash { return sha3.New384() }, true},
+	{"sha3-512", func() hash.Hash { return sha3.New512() }, true},
+	{"ripemd160", newRIPEMD160, true},
+	{"adler32", func() hash.Hash { return adler32.New() }, false},
+	{"crc32", newCRC32BZip2, false},
 	{"crc32b", func() hash.Hash { return crc32.NewIEEE() }, false},
+	{"crc32c", func() hash.Hash { return crc32.New(crc32.MakeTable(crc32.Castagnoli)) }, false},
+	{"fnv132", func() hash.Hash { return fnv.New32() }, false},
+	{"fnv1a32", func() hash.Hash { return fnv.New32a() }, false},
+	{"fnv164", func() hash.Hash { return fnv.New64() }, false},
+	{"fnv1a64", func() hash.Hash { return fnv.New64a() }, false},
+	{"joaat", newJoaat, false},
+	{"xxh32", newXXH32, false},
+	{"xxh64", newXXH64, false},
+	{"xxh3", newXXH3, false},
 }
+
+func md5Algo() hashAlgo  { a, _ := findAlgo("md5"); return a }
+func sha1Algo() hashAlgo { a, _ := findAlgo("sha1"); return a }
 
 func findAlgo(name string) (hashAlgo, bool) {
 	lo := strings.ToLower(name)

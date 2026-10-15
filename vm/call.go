@@ -63,6 +63,15 @@ func (vm *VM) opInit(op bytecode.Opcode, in bytecode.Instr) {
 	case bytecode.OpInitNew:
 		spec.kind = callNew
 		spec.classID = in.Op1
+		// new self, new parent et new static désignent la classe de portée, sa parente ou la classe appelée du cadre courant.
+		switch {
+		case in.Flags&bytecode.FlagSelf != 0:
+			spec.classID = fr.scopeClass
+		case in.Flags&bytecode.FlagParent != 0:
+			spec.classID = vm.parentOf(fr.scopeClass)
+		case in.Flags&bytecode.FlagStatic != 0:
+			spec.classID = fr.calledClass
+		}
 		spec.method = "__construct"
 	}
 	if vm.stop {
@@ -186,22 +195,11 @@ func (vm *VM) opDoCall() {
 	}
 }
 
-func nativeHasRefArgs(name string) bool {
-	switch strings.ToLower(strings.TrimPrefix(name, `\`)) {
-	case "preg_match", "preg_match_all", "preg_replace", "preg_replace_callback",
-		"str_replace", "str_ireplace", "parse_str", "headers_sent", "exec",
-		"natsort", "natcasesort", "shuffle", "settype",
-		"array_multisort", "similar_text", "sscanf":
-		return true
-	default:
-		return false
-	}
-}
-
 func nativeNeedsSync(name string) bool {
 	switch strings.ToLower(strings.TrimPrefix(name, `\`)) {
 	case "session_write_close", "session_commit", "session_encode",
-		"session_start", "session_reset", "session_unset", "session_decode", "session_destroy":
+		"session_start", "session_reset", "session_unset", "session_decode", "session_destroy",
+		"stream_wrapper_register", "stream_register_wrapper":
 		return true
 	default:
 		return false
@@ -245,7 +243,8 @@ func (vm *VM) doFunc(spec callSpec, line uint32) {
 						}
 					} else {
 						for i, arg := range spec.args {
-							if nativeArgIsRef(spec.method, i) && arg.Type == types.TypeReference {
+							if bytecode.NativeArgIsRef(spec.method, i) && arg.Type == types.TypeReference {
+								vm.separateRefArray(arg)
 								args[i] = arg
 							} else {
 								args[i] = types.Deref(vm.Zone, arg)
@@ -274,7 +273,7 @@ func (vm *VM) doFunc(spec callSpec, line uint32) {
 		}
 		if spec.flags&bytecode.FlagNative != 0 {
 			for i, fn := range vm.Program.Funcs {
-				if strings.EqualFold(fn.Name, spec.method) {
+				if fn != nil && !bytecode.AnonymousFunc(fn.Name) && strings.EqualFold(fn.Name, spec.method) {
 					spec.flags &^= bytecode.FlagNative
 					spec.funcIndex = i
 					if spec.icPC >= 0 {
@@ -292,89 +291,7 @@ func (vm *VM) doFunc(spec callSpec, line uint32) {
 		}
 	}
 	if spec.flags&bytecode.FlagNative != 0 {
-		if len(spec.named) > 0 {
-			for _, arg := range spec.named {
-				v := arg.val
-				vmRelease(vm.Zone, &v)
-			}
-			vm.releaseArgs(spec.args)
-			vm.fatalFeature("arguments nommes de fonction native")
-			return
-		}
-		if vm.intrinsic(spec, line) {
-			vm.releaseArgs(spec.args)
-			return
-		}
-		if vm.extIntrinsic(spec, line) {
-			return
-		}
-		if strings.EqualFold(spec.method, "error_reporting") {
-			if len(spec.args) > 1 {
-				vm.releaseArgs(spec.args)
-				vm.raiseBuiltin(bytecode.ClassArgumentCountError, "error_reporting() expects at most 1 argument, "+strconv.Itoa(len(spec.args))+" given", 0)
-				return
-			}
-			old := vm.errorReporting
-			if len(spec.args) == 1 {
-				arg := types.Deref(vm.Zone, spec.args[0])
-				if arg.Type != types.TypeNull {
-					vm.errorReporting = vm.toLong(arg)
-				}
-			}
-			vm.releaseArgs(spec.args)
-			vm.push(types.NewLong(old))
-			vm.bump()
-			return
-		}
-		native, ok := lookupNative(spec.method)
-		if !ok {
-			vm.releaseArgs(spec.args)
-			vm.raiseBuiltin(bytecode.ClassError, "Call to undefined function "+spec.method+"()", 0)
-			return
-		}
-		if spec.icPC >= 0 && !isPotentialIntrinsic(spec.method) {
-			fr := vm.frame()
-			if c := vm.ensureCallCache(fr.fn); int(spec.icPC) < len(c) {
-				funcsLen := 0
-				if vm.Program != nil {
-					funcsLen = len(vm.Program.Funcs)
-				}
-				c[spec.icPC] = bytecode.CallIC{
-					ProgFuncsLen: funcsLen,
-					FuncIdx:      -1,
-					Kind:         2,
-					NativeNoRef:  !nativeHasRefArgs(spec.method),
-					NativeSync:   nativeNeedsSync(spec.method),
-					Native:       native,
-				}
-			}
-		}
-		var argBuf [8]types.Value
-		var args []types.Value
-		if len(spec.args) <= len(argBuf) {
-			args = argBuf[:len(spec.args)]
-		} else {
-			args = make([]types.Value, len(spec.args))
-		}
-		for i, arg := range spec.args {
-			if nativeArgIsRef(spec.method, i) && arg.Type == types.TypeReference {
-				args[i] = arg
-			} else {
-				args[i] = types.Deref(vm.Zone, arg)
-			}
-		}
-		vm.preNativeCallSync(spec.method)
-		val, err := native(vm.Zone, vm.Out, args)
-		if err != nil {
-			vmRelease(vm.Zone, &val)
-			vm.raiseNativeError(err, spec.method, args, line)
-			vm.releaseArgs(spec.args)
-			return
-		}
-		vm.postNativeCallSync(spec.method)
-		vm.releaseArgs(spec.args)
-		vm.push(val)
-		vm.bump()
+		vm.doNative(spec, line)
 		return
 	}
 	if vm.Program == nil || spec.funcIndex < 0 || spec.funcIndex >= len(vm.Program.Funcs) {
@@ -415,12 +332,118 @@ func (vm *VM) doFunc(spec callSpec, line uint32) {
 	vm.bump()
 }
 
+// doNative exécute l'appel d'une fonction native désignée par son nom : intrinsèque de la VM, intrinsèque
+// d'extension, error_reporting, puis fonction des bibliothèques natives. Le résultat est empilé et le compteur
+// ordinal avancé, comme pour toute instruction d'appel.
+func (vm *VM) doNative(spec callSpec, line uint32) {
+	if len(spec.named) > 0 {
+		for _, arg := range spec.named {
+			v := arg.val
+			vmRelease(vm.Zone, &v)
+		}
+		vm.releaseArgs(spec.args)
+		vm.fatalFeature("arguments nommes de fonction native")
+		return
+	}
+	if vm.intrinsic(spec, line) {
+		vm.releaseArgs(spec.args)
+		return
+	}
+	if vm.extIntrinsic(spec, line) {
+		return
+	}
+	if strings.EqualFold(spec.method, "error_reporting") {
+		if len(spec.args) > 1 {
+			vm.releaseArgs(spec.args)
+			vm.raiseBuiltin(bytecode.ClassArgumentCountError, "error_reporting() expects at most 1 argument, "+strconv.Itoa(len(spec.args))+" given", 0)
+			return
+		}
+		old := vm.effectiveErrorReporting()
+		if len(spec.args) == 1 {
+			arg := types.Deref(vm.Zone, spec.args[0])
+			if arg.Type != types.TypeNull {
+				vm.errorReporting = vm.toLong(arg)
+			}
+		}
+		vm.releaseArgs(spec.args)
+		vm.push(types.NewLong(old))
+		vm.bump()
+		return
+	}
+	native, ok := lookupNative(spec.method)
+	if !ok {
+		vm.releaseArgs(spec.args)
+		vm.raiseBuiltin(bytecode.ClassError, "Call to undefined function "+spec.method+"()", 0)
+		return
+	}
+	if spec.icPC >= 0 && !isPotentialIntrinsic(spec.method) {
+		fr := vm.frame()
+		if c := vm.ensureCallCache(fr.fn); int(spec.icPC) < len(c) {
+			funcsLen := 0
+			if vm.Program != nil {
+				funcsLen = len(vm.Program.Funcs)
+			}
+			c[spec.icPC] = bytecode.CallIC{
+				ProgFuncsLen: funcsLen,
+				FuncIdx:      -1,
+				Kind:         2,
+				NativeNoRef:  !bytecode.NativeHasRefArgs(spec.method),
+				NativeSync:   nativeNeedsSync(spec.method),
+				Native:       native,
+			}
+		}
+	}
+	var argBuf [8]types.Value
+	var args []types.Value
+	if len(spec.args) <= len(argBuf) {
+		args = argBuf[:len(spec.args)]
+	} else {
+		args = make([]types.Value, len(spec.args))
+	}
+	for i, arg := range spec.args {
+		if bytecode.NativeArgIsRef(spec.method, i) && arg.Type == types.TypeReference {
+			vm.separateRefArray(arg)
+			args[i] = arg
+		} else {
+			args[i] = types.Deref(vm.Zone, arg)
+		}
+	}
+	vm.preNativeCallSync(spec.method)
+	val, err := native(vm.Zone, vm.Out, args)
+	if err != nil {
+		vmRelease(vm.Zone, &val)
+		vm.raiseNativeError(err, spec.method, args, line)
+		vm.releaseArgs(spec.args)
+		return
+	}
+	vm.postNativeCallSync(spec.method)
+	vm.releaseArgs(spec.args)
+	vm.push(val)
+	vm.bump()
+}
+
+// separateRefArray rend exclusif le tableau désigné par une référence transmise à une fonction native, comme la
+// séparation de PHP avant l'écriture d'un paramètre &$array : un tableau partagé par copie sur écriture est
+// dupliqué dans l'arène, curseur interne compris, et la référence reçoit la copie ; l'autre détenteur garde
+// l'original intact.
+func (vm *VM) separateRefArray(ref types.Value) {
+	target := types.Deref(vm.Zone, ref)
+	if target.Type != types.TypeArray || types.ArrayInfo(vm.Zone, target).RefCount <= 1 {
+		return
+	}
+	// SeparateArray suit la référence et remplace la cible de sa cellule par la copie, tableau vide compris.
+	cell := ref
+	_ = types.SeparateArray(vm.Zone, &cell)
+}
+
 func (vm *VM) traceArgs(args []types.Value) string {
 	var text strings.Builder
 	for i, arg := range args {
 		if i > 0 {
 			text.WriteString(", ")
 		}
+		// Un paramètre par référence se décrit par sa valeur ; la trace n'exécute jamais de code utilisateur.
+		arg = types.Deref(vm.Zone, arg)
 		switch arg.Type {
 		case types.TypeNull, types.TypeUndef:
 			text.WriteString("NULL")
@@ -444,15 +467,17 @@ func (vm *VM) traceArgs(args []types.Value) string {
 		case types.TypeArray:
 			text.WriteString("Array")
 		case types.TypeObject:
-			text.WriteString("Object(" + vm.className(types.ObjectInfo(vm.Zone, arg).ClassID) + ")")
+			text.WriteString("Object(" + displayClassName(vm.className(types.ObjectInfo(vm.Zone, arg).ClassID)) + ")")
 		case types.TypeFalse, types.TypeTrue:
 			text.WriteString(strconv.FormatBool(arg.Type == types.TypeTrue))
+		case types.TypeLong:
+			text.WriteString(strconv.FormatInt(int64(arg.Scalar), 10))
+		case types.TypeDouble:
+			text.WriteString(formatFloat(arg.ToDouble()))
+		case types.TypeResource:
+			text.WriteString("Resource id #" + strconv.FormatUint(uint64(arg.DataSlot), 10))
 		default:
-			s, own := vm.stringify(arg)
-			text.WriteString(types.StringData(vm.Zone, s))
-			if own {
-				types.ReleaseValue(vm.Zone, &s)
-			}
+			text.WriteString("Unknown")
 		}
 	}
 	return text.String()
@@ -607,6 +632,12 @@ func (vm *VM) doNew(spec callSpec, line uint32) {
 		return
 	}
 	vm.initProps(classID, obj)
+	if vm.stop || vm.control {
+		// Une valeur initiale différée a levé une exception : l'instanciation est abandonnée.
+		vm.releaseArgs(spec.args)
+		types.ReleaseValue(vm.Zone, &obj)
+		return
+	}
 	if m, _, ok := vm.findMethod(classID, "__construct"); ok {
 		if !vm.bindNamed(&spec, m.Func) {
 			types.ReleaseValue(vm.Zone, &obj)
@@ -835,6 +866,9 @@ func (vm *VM) bindParams(fn *bytecode.OpArray, args []types.Value) {
 				vmRelease(vm.Zone, slot)
 			}
 			*slot = vm.constantValue(p.DefaultConst)
+			if vm.stop || vm.control {
+				return
+			}
 			continue
 		}
 		if p.HasDefaultString {
@@ -1073,3 +1107,80 @@ func (vm *VM) runDestructor(obj types.Value) {
 	}
 }
 
+// funcArgByRef indique si l'argument en cours d'évaluation pour l'appel en attente le plus récent se transmet
+// par référence, d'après la signature de l'appelé résolue une fois par appel.
+func (vm *VM) funcArgByRef() bool {
+	if len(vm.pending) == 0 {
+		return false
+	}
+	spec := &vm.pending[len(vm.pending)-1]
+	if !spec.refResolved {
+		vm.resolveArgRefs(spec)
+	}
+	idx := len(spec.args)
+	if spec.refNative != "" {
+		return bytecode.NativeArgIsRef(spec.refNative, idx)
+	}
+	return paramByRef(spec.refParams, idx)
+}
+
+func paramByRef(params []bytecode.ParamInfo, idx int) bool {
+	if idx < len(params) {
+		return params[idx].ByRef
+	}
+	if n := len(params); n > 0 && params[n-1].Variadic {
+		return params[n-1].ByRef
+	}
+	return false
+}
+
+// resolveArgRefs lit la signature de l'appelé d'un appel en attente : fonction utilisateur ou native, fermeture
+// ou chaîne et tableau appelables, méthode, méthode statique ou constructeur.
+func (vm *VM) resolveArgRefs(spec *callSpec) {
+	spec.refResolved = true
+	switch spec.kind {
+	case callFunc:
+		if spec.flags&bytecode.FlagNative == 0 {
+			if spec.funcIndex >= 0 && spec.funcIndex < len(vm.Program.Funcs) && vm.Program.Funcs[spec.funcIndex] != nil {
+				spec.refParams = vm.Program.Funcs[spec.funcIndex].Params
+			}
+			return
+		}
+		if fr := vm.frame(); spec.icPC >= 0 {
+			if c := vm.callCache(fr.fn); int(spec.icPC) < len(c) {
+				ic := c[spec.icPC]
+				if ic.Kind == 2 && ic.NativeNoRef && ic.ProgFuncsLen == len(vm.Program.Funcs) {
+					return
+				}
+			}
+		}
+		if i := vm.userFuncIndex(spec.method); i >= 0 && vm.Program.Funcs[i] != nil {
+			spec.refParams = vm.Program.Funcs[i].Params
+			return
+		}
+		if bytecode.NativeHasRefArgs(spec.method) {
+			spec.refNative = spec.method
+		}
+	case callClosure:
+		d := types.Deref(vm.Zone, spec.obj)
+		if d.Type == types.TypeObject && types.ObjectInfo(vm.Zone, d).ClassID == bytecode.ClassClosure {
+			idx := int(types.ObjectGet(vm.Zone, d, 0).ToLong())
+			if idx >= 0 && idx < len(vm.closures) && vm.closures[idx].live && vm.closures[idx].fn != nil {
+				spec.refParams = vm.closures[idx].fn.Params
+			}
+			return
+		}
+		if inner, ok := vm.callback(spec.obj); ok && inner.kind != callClosure {
+			vm.resolveArgRefs(&inner)
+			spec.refParams, spec.refNative = inner.refParams, inner.refNative
+		}
+	case callMethod, callStatic:
+		if m, _, ok := vm.findMethod(spec.classID, spec.method); ok && m.Func != nil {
+			spec.refParams = m.Func.Params
+		}
+	case callNew:
+		if m, _, ok := vm.findMethod(spec.classID, "__construct"); ok && m.Func != nil {
+			spec.refParams = m.Func.Params
+		}
+	}
+}

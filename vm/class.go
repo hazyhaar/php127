@@ -6,8 +6,23 @@ import (
 	"strings"
 
 	"code.hazyhaar.fr/devhoros/php127/bytecode"
+	"code.hazyhaar.fr/devhoros/php127/ext"
 	"code.hazyhaar.fr/devhoros/php127/types"
 )
+
+func opaqueResourceClassID(extra uint16) (uint32, bool) {
+	switch extra {
+	case ext.ResourceKindGD:
+		return bytecode.ClassGdImage, true
+	case ext.ResourceKindFinfo:
+		return bytecode.ClassFinfo, true
+	case ext.ResourceKindCurl:
+		return bytecode.ClassCurlHandle, true
+	case ext.ResourceKindXML:
+		return bytecode.ClassXMLParser, true
+	}
+	return 0, false
+}
 
 func (vm *VM) classByID(id uint32) *bytecode.ClassProto {
 	if vm.Program != nil {
@@ -15,6 +30,12 @@ func (vm *VM) classByID(id uint32) *bytecode.ClassProto {
 			if c := vm.Program.Classes[idx]; c != nil && c.ID == id {
 				return c
 			}
+		}
+		if vm.classIndex != nil {
+			if c, ok := vm.classIndex[id]; ok {
+				return c
+			}
+			return builtinProto(id)
 		}
 		for _, c := range vm.Program.Classes {
 			if c != nil && c.ID == id {
@@ -28,6 +49,15 @@ func (vm *VM) classByID(id uint32) *bytecode.ClassProto {
 		}
 	}
 	return builtinProto(id)
+}
+
+// displayClassName rend le nom de classe tel que l'affichent var_dump et les traces de PHP : le nom interne d'une
+// classe anonyme s'y arrête à son octet nul.
+func displayClassName(name string) string {
+	if i := strings.IndexByte(name, 0); i >= 0 {
+		return name[:i]
+	}
+	return name
 }
 
 func (vm *VM) className(id uint32) string {
@@ -267,10 +297,12 @@ func (vm *VM) classAllowsDynamicProperties(cid uint32) bool {
 	return false
 }
 
-func (vm *VM) emitDynamicPropDeprecation(cid uint32, name string) {
-	if !vm.classAllowsDynamicProperties(cid) && vm.errorReporting&8192 != 0 && vm.Out != nil {
-		fmt.Fprintf(vm.Out, "\nDeprecated: Creation of dynamic property %s::$%s is deprecated in %s on line %d\n", vm.className(cid), name, vm.file(), vm.line)
+// emitDynamicPropDeprecation signale la création d'une propriété dynamique ; le résultat vrai signale que le gestionnaire d'erreurs a interrompu l'instruction.
+func (vm *VM) emitDynamicPropDeprecation(cid uint32, name string) bool {
+	if !vm.classAllowsDynamicProperties(cid) {
+		return vm.raiseDiag(eDeprecated, diagDeprecate, "Creation of dynamic property "+vm.className(cid)+"::$"+name+" is deprecated", vm.line)
 	}
+	return false
 }
 
 func (vm *VM) inMagic(slot uint32, name string) bool {
@@ -375,13 +407,11 @@ func (vm *VM) resolvePropName(fr *frame, nameIdx uint32) (string, bool) {
 		if err == nil && fr.cvBase+cvIdx < len(vm.slots) {
 			v := vm.slots[fr.cvBase+cvIdx]
 			if v.IsUndef() {
-				if vm.errorReporting&2 != 0 && vm.Out != nil {
-					cvName := ""
-					if cvIdx < len(fr.fn.CVNames) {
-						cvName = fr.fn.CVNames[cvIdx]
-					}
-					fmt.Fprintf(vm.Out, "\nWarning: Undefined variable $%s in %s on line %d\n", cvName, vm.file(), vm.line)
+				cvName := ""
+				if cvIdx < len(fr.fn.CVNames) {
+					cvName = fr.fn.CVNames[cvIdx]
 				}
+				vm.reportDiag(eWarning, diagWarning, "Undefined variable $"+cvName, vm.file(), vm.line)
 				return "", true
 			}
 			ks, own := vm.stringify(v)
@@ -399,6 +429,9 @@ func (vm *VM) resolvePropName(fr *frame, nameIdx uint32) (string, bool) {
 }
 
 func (vm *VM) opFetchProp(op bytecode.Opcode, nameIdx uint32, flags uint16) {
+	if flags&bytecode.FlagFuncArg != 0 && vm.funcArgByRef() {
+		op = bytecode.OpFetchPropW
+	}
 	obj := vm.pop()
 	if vm.stop {
 		vmRelease(vm.Zone, &obj)
@@ -437,8 +470,8 @@ func (vm *VM) opFetchProp(op bytecode.Opcode, nameIdx uint32, flags uint16) {
 			vm.raiseBuiltin(bytecode.ClassError, fmt.Sprintf("Attempt to modify property %q on %s", name, tname), 0)
 			return
 		}
-		if vm.errorReporting&2 != 0 && vm.Out != nil {
-			fmt.Fprintf(vm.Out, "\nWarning: Attempt to read property %q on %s in %s on line %d\n", name, tname, vm.file(), vm.line)
+		if vm.raiseDiag(eWarning, diagWarning, fmt.Sprintf("Attempt to read property %q on %s", name, tname), vm.line) {
+			return
 		}
 		vm.push(types.NewNull())
 		vm.bump()
@@ -467,7 +500,10 @@ func (vm *VM) opFetchProp(op bytecode.Opcode, nameIdx uint32, flags uint16) {
 	if !ok {
 		if op == bytecode.OpFetchPropW {
 			if _, exists := vm.dynamicPropGet(d, name); !exists {
-				vm.emitDynamicPropDeprecation(cid, name)
+				if vm.emitDynamicPropDeprecation(cid, name) {
+					vmRelease(vm.Zone, &obj)
+					return
+				}
 			}
 			if ref, dynOK := vm.dynamicPropRef(d, name); dynOK {
 				vmRelease(vm.Zone, &obj)
@@ -504,8 +540,8 @@ func (vm *VM) opFetchProp(op bytecode.Opcode, nameIdx uint32, flags uint16) {
 			}
 		}
 		vmRelease(vm.Zone, &obj)
-		if flags&bytecode.FlagIsset == 0 && vm.errorReporting&2 != 0 && vm.Out != nil {
-			fmt.Fprintf(vm.Out, "\nWarning: Undefined property: %s::$%s in %s on line %d\n", vm.className(cid), name, vm.file(), vm.line)
+		if flags&bytecode.FlagIsset == 0 && vm.raiseDiag(eWarning, diagWarning, "Undefined property: "+vm.className(cid)+"::$"+name, vm.line) {
+			return
 		}
 		vm.push(types.NewNull())
 		vm.bump()
@@ -532,8 +568,8 @@ func (vm *VM) opFetchProp(op bytecode.Opcode, nameIdx uint32, flags uint16) {
 			return
 		}
 		vmRelease(vm.Zone, &obj)
-		if flags&bytecode.FlagIsset == 0 && vm.errorReporting&2 != 0 && vm.Out != nil {
-			fmt.Fprintf(vm.Out, "\nWarning: Undefined property: %s::$%s in %s on line %d\n", vm.className(cid), name, vm.file(), vm.line)
+		if flags&bytecode.FlagIsset == 0 && vm.raiseDiag(eWarning, diagWarning, "Undefined property: "+vm.className(cid)+"::$"+name, vm.line) {
+			return
 		}
 		vm.push(types.NewNull())
 		vm.bump()
@@ -681,8 +717,10 @@ func (vm *VM) opAssignProp(op bytecode.Opcode, in bytecode.Instr) {
 				}
 			}
 			if !dynOK {
-				if vm.errorReporting&2 != 0 && vm.Out != nil {
-					fmt.Fprintf(vm.Out, "\nWarning: Undefined property: %s::$%s in %s on line %d\n", vm.className(cid), name, vm.file(), vm.line)
+				if vm.raiseDiag(eWarning, diagWarning, "Undefined property: "+vm.className(cid)+"::$"+name, vm.line) {
+					vmRelease(vm.Zone, &val)
+					vmRelease(vm.Zone, &obj)
+					return
 				}
 				cur = types.NewNull()
 			}
@@ -727,7 +765,11 @@ func (vm *VM) opAssignProp(op bytecode.Opcode, in bytecode.Instr) {
 				return
 			}
 		}
-		vm.emitDynamicPropDeprecation(cid, name)
+		if vm.emitDynamicPropDeprecation(cid, name) {
+			vmRelease(vm.Zone, &val)
+			vmRelease(vm.Zone, &obj)
+			return
+		}
 		if vm.dynamicPropSet(d, name, val) {
 			vmRelease(vm.Zone, &obj)
 			if !vm.stop && !vm.control {
@@ -767,8 +809,10 @@ func (vm *VM) opAssignProp(op bytecode.Opcode, in bytecode.Instr) {
 	}
 	if op == bytecode.OpAssignPropOp {
 		if cur.IsUndef() {
-			if vm.errorReporting&2 != 0 && vm.Out != nil {
-				fmt.Fprintf(vm.Out, "\nWarning: Undefined property: %s::$%s in %s on line %d\n", vm.className(cid), name, vm.file(), vm.line)
+			if vm.raiseDiag(eWarning, diagWarning, "Undefined property: "+vm.className(cid)+"::$"+name, vm.line) {
+				vmRelease(vm.Zone, &val)
+				vmRelease(vm.Zone, &obj)
+				return
 			}
 			cur = types.NewNull()
 		}
@@ -783,7 +827,7 @@ func (vm *VM) opAssignProp(op bytecode.Opcode, in bytecode.Instr) {
 		if !cur.IsUndef() {
 			vmRelease(vm.Zone, &val)
 			vmRelease(vm.Zone, &obj)
-			vm.raiseBuiltin(bytecode.ClassError, "Cannot modify readonly property "+vm.className(info.ClassID)+"::$"+name, 0)
+			vm.raiseBuiltin(bytecode.ClassError, "Cannot modify readonly property "+displayClassName(vm.className(info.ClassID))+"::$"+name, 0)
 			return
 		}
 	}
@@ -845,7 +889,7 @@ func (vm *VM) opPropQuery(op bytecode.Opcode, nameIdx uint32) {
 			if op == bytecode.OpEmptyProp {
 				vm.push(types.NewBool(!types.ToBoolZ(vm.Zone, cur)))
 			} else {
-				vm.push(types.NewBool(!types.Deref(vm.Zone, cur).IsNull()))
+				vm.push(types.NewBool(isSetValue(vm.Zone, cur)))
 			}
 			vmRelease(vm.Zone, &obj)
 			vm.bump()
@@ -1081,6 +1125,11 @@ func (vm *VM) opClassConst(in bytecode.Instr) {
 		classID = vm.parentOf(vm.frame().scopeClass)
 	}
 	if value, ok := vm.lookupClassConst(classID, name); ok {
+		if vm.stop || vm.control {
+			// L'évaluation différée de la constante a levé une exception.
+			vmRelease(vm.Zone, &value)
+			return
+		}
 		vm.push(value)
 		vm.bump()
 		return
@@ -1089,6 +1138,7 @@ func (vm *VM) opClassConst(in bytecode.Instr) {
 }
 
 func (vm *VM) lookupClassConst(classID uint32, name string) (types.Value, bool) {
+	start := classID
 	if c := vm.classByID(classID); c != nil && c.Kind == bytecode.KindEnum {
 		cases := vm.enumCases(c)
 		for i, entry := range c.Cases {
@@ -1120,6 +1170,51 @@ func (vm *VM) lookupClassConst(classID uint32, name string) (types.Value, bool) 
 		classID = c.ParentID
 		seen++
 	}
+	for id, depth := start, 0; id >= bytecode.ClassUser && depth < 64; depth++ {
+		c := vm.classByID(id)
+		if c == nil {
+			break
+		}
+		if v, ok := vm.interfaceConst(c.Interfaces, name, 0); ok {
+			return v, true
+		}
+		if c.ParentID == id {
+			break
+		}
+		id = c.ParentID
+	}
+	return types.Value{}, false
+}
+
+// interfaceConst cherche une constante héritée d'une interface utilisateur, y compris par les interfaces des classes parentes.
+func (vm *VM) interfaceConst(names []string, name string, depth int) (types.Value, bool) {
+	if depth > 32 {
+		return types.Value{}, false
+	}
+	for _, iname := range names {
+		iid, ok := vm.resolveName(iname)
+		if !ok || iid < bytecode.ClassUser {
+			continue
+		}
+		ic := vm.classByID(iid)
+		if ic == nil {
+			continue
+		}
+		for _, cst := range ic.Constants {
+			if cst.Name == name {
+				if cst.Initial != nil {
+					return vm.constantValue(cst.Initial), true
+				}
+				if cst.IsString {
+					return vm.constantValue(&bytecode.Constant{Text: cst.Text, IsString: true}), true
+				}
+				return types.RetainValue(vm.Zone, cst.Value), true
+			}
+		}
+		if v, ok := vm.interfaceConst(ic.Interfaces, name, depth+1); ok {
+			return v, true
+		}
+	}
 	return types.Value{}, false
 }
 
@@ -1130,6 +1225,12 @@ func (vm *VM) opInstanceof(classID uint32) {
 	}
 	defer types.ReleaseValue(vm.Zone, &v)
 	d := types.Deref(vm.Zone, v)
+	if d.Type == types.TypeResource {
+		cid, ok := opaqueResourceClassID(d.Extra)
+		vm.push(types.NewBool(ok && cid == vm.aliasTarget(classID)))
+		vm.bump()
+		return
+	}
 	if d.Type != types.TypeObject {
 		vm.push(types.NewBool(false))
 		vm.bump()
@@ -1141,6 +1242,10 @@ func (vm *VM) opInstanceof(classID uint32) {
 }
 
 func (vm *VM) isInstance(objClass, want uint32) bool {
+	if objClass == want {
+		return true
+	}
+	want = vm.aliasTarget(want)
 	if objClass == want {
 		return true
 	}
@@ -1158,7 +1263,7 @@ func (vm *VM) isInstance(objClass, want uint32) bool {
 			return false
 		}
 		for _, name := range c.Interfaces {
-			if iid, ok := vm.resolveName(name); ok && (iid == want || vm.inherits(iid, want)) {
+			if iid, ok := vm.resolveName(name); ok && (iid == want || vm.inherits(iid, want) || vm.interfaceExtends(iid, want, 0)) {
 				return true
 			}
 		}
@@ -1168,19 +1273,296 @@ func (vm *VM) isInstance(objClass, want uint32) bool {
 	return false
 }
 
+// interfaceExtends parcourt les interfaces parentes d'une interface utilisateur, déclarées par extends dans Interfaces.
+func (vm *VM) interfaceExtends(iid, want uint32, depth int) bool {
+	if depth > 32 || iid < bytecode.ClassUser {
+		return false
+	}
+	c := vm.classByID(iid)
+	if c == nil || c.Kind != bytecode.KindInterface {
+		return false
+	}
+	for _, name := range c.Interfaces {
+		pid, ok := vm.resolveName(name)
+		if !ok {
+			continue
+		}
+		if pid == want || vm.interfaceExtends(pid, want, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
 func (vm *VM) resolveName(name string) (uint32, bool) {
+	name = strings.TrimPrefix(name, `\`)
 	if id, ok := bytecode.BuiltinClassID(name); ok {
 		return id, true
 	}
 	if vm.Program == nil {
 		return 0, false
 	}
+	if len(vm.classAliases) > 0 {
+		if id, ok := vm.classAliases[strings.ToLower(name)]; ok {
+			return id, true
+		}
+	}
+	if vm.classNames != nil {
+		id, ok := vm.classNames[strings.ToLower(name)]
+		return id, ok
+	}
 	for _, c := range vm.Program.Classes {
 		if c != nil && strings.EqualFold(c.Name, name) {
 			return c.ID, true
 		}
 	}
+	for _, c := range vm.Program.Traits {
+		if c != nil && strings.EqualFold(c.Name, name) {
+			return c.ID, true
+		}
+	}
 	return 0, false
+}
+
+// aliasTarget remplace l'identifiant d'une classe non déclarée dont le nom est un alias de class_alias par celui de la classe visée.
+func (vm *VM) aliasTarget(id uint32) uint32 {
+	if len(vm.classAliases) == 0 || id < bytecode.ClassUser {
+		return id
+	}
+	c := vm.classByID(id)
+	if c == nil {
+		return id
+	}
+	if target, ok := vm.classAliases[strings.ToLower(c.Name)]; ok {
+		return target
+	}
+	return id
+}
+
+// classOperand résout un opérande de classe de bytecode vers une classe déclarée, en passant par les alias, les déclarations en attente puis l'autoloader SPL.
+func (vm *VM) classOperand(id uint32) (uint32, bool) {
+	if _, builtin := bytecode.BuiltinClassName(id); builtin {
+		return id, true
+	}
+	c := vm.classByID(id)
+	if c == nil {
+		return id, false
+	}
+	if vm.classDeclared(c) {
+		return id, true
+	}
+	if target, ok := vm.declaredClassByName(c.Name, true); ok {
+		return target.ID, true
+	}
+	return id, false
+}
+
+// dynamicClassOperand résout la classe désignée à l'exécution par la variable compilée cv du cadre courant : un
+// objet désigne sa classe, une chaîne une classe déclarée, autochargée au besoin. Pour instanceof (lenient), une
+// classe introuvable rend 0 sans autoload ni erreur, comme ZEND_INSTANCEOF. Un refus rend le message de l'Error de
+// PHP, que l'appelant lève après avoir dépilé ses opérandes ; une exception de l'autoloader laisse vm.control posé.
+func (vm *VM) dynamicClassOperand(cv uint32, lenient bool) (uint32, string) {
+	fr := vm.frame()
+	v := types.Deref(vm.Zone, vm.slots[fr.cvBase+int(cv)])
+	switch v.Type {
+	case types.TypeObject:
+		return types.ObjectInfo(vm.Zone, v).ClassID, ""
+	case types.TypeResource:
+		if cid, ok := opaqueResourceClassID(v.Extra); ok {
+			return cid, ""
+		}
+	case types.TypeString:
+		name := strings.Clone(strings.TrimPrefix(types.StringData(vm.Zone, v), `\`))
+		if id, ok := bytecode.BuiltinClassID(name); ok {
+			return id, ""
+		}
+		c, ok := vm.declaredClassByName(name, !lenient)
+		if ok {
+			return c.ID, ""
+		}
+		if lenient || vm.stop || vm.control {
+			return 0, ""
+		}
+		return 0, `Class "` + name + `" not found`
+	}
+	return 0, "Class name must be a valid object or a string"
+}
+
+// dynamicClassName empile le résultat de $x::class : le nom de la classe d'un objet ; toute autre valeur lève la
+// TypeError de PHP.
+func (vm *VM) dynamicClassName(cv uint32) {
+	fr := vm.frame()
+	v := types.Deref(vm.Zone, vm.slots[fr.cvBase+int(cv)])
+	var cid uint32
+	if v.Type == types.TypeObject {
+		cid = types.ObjectInfo(vm.Zone, v).ClassID
+	} else if rc, ok := opaqueResourceClassID(v.Extra); v.Type == types.TypeResource && ok {
+		cid = rc
+	} else {
+		vm.raiseBuiltin(bytecode.ClassTypeError, `Cannot use "::class" on `+vm.operandTypeName(v), 0)
+		return
+	}
+	s, err := types.NewStringLiteral(vm.Zone, vm.className(cid))
+	if err != nil {
+		vm.fatalFeature("constante de classe")
+		return
+	}
+	vm.push(s)
+	vm.bump()
+}
+
+func (vm *VM) raiseClassNotFound(id uint32) {
+	vm.raiseBuiltin(bytecode.ClassError, `Class "`+vm.className(id)+`" not found`, 0)
+}
+
+// classIsPlaceholder reconnaît le prototype vide que le compilateur crée pour un nom de classe seulement référencé.
+func classIsPlaceholder(c *bytecode.ClassProto) bool {
+	return c.Kind == bytecode.KindClass && c.Flags == 0 && c.ParentName == "" && len(c.Interfaces) == 0 && len(c.Traits) == 0 &&
+		len(c.Props) == 0 && len(c.Methods) == 0 && len(c.Constants) == 0 && len(c.Attributes) == 0 && len(c.Cases) == 0
+}
+
+// classDeclared distingue une classe déclarée d'un nom seulement référencé : état explicite pour les classes liées dynamiquement, sinon classement du programme principal.
+func (vm *VM) classDeclared(c *bytecode.ClassProto) bool {
+	if c == nil {
+		return false
+	}
+	if c.ID < bytecode.ClassUser {
+		return true
+	}
+	if _, builtin := bytecode.BuiltinClassName(c.ID); builtin {
+		return true
+	}
+	if st, ok := vm.classState[c.ID]; ok {
+		return st
+	}
+	if vm.classState == nil {
+		vm.classState = make(map[uint32]bool)
+	}
+	declared := vm.mainDeclares(c)
+	if declared && !classIsPlaceholder(c) {
+		// État provisoire contre une chaîne d'héritage cyclique pendant l'examen des ancêtres.
+		vm.classState[c.ID] = true
+		if vm.mainNeedsLateBinding(c) {
+			declared = false
+			vm.pendingClasses = append(vm.pendingClasses, vm.mainPendingEntry(c))
+		}
+	}
+	vm.classState[c.ID] = declared
+	return declared
+}
+
+// mainNeedsLateBinding signale une classe du programme principal dont le parent ou un trait n'est pas encore déclaré, typiquement fourni par un fichier inclus plus tard ou par l'autoloader : PHP ne la déclare qu'à l'exécution de son instruction, la VM la met en attente de liaison.
+func (vm *VM) mainNeedsLateBinding(c *bytecode.ClassProto) bool {
+	if c.ParentName != "" {
+		if _, builtin := bytecode.BuiltinClassID(c.ParentName); !builtin {
+			p := vm.classByID(c.ParentID)
+			if c.ParentID == bytecode.ClassNone || p == nil || !strings.EqualFold(strings.TrimPrefix(p.Name, `\`), strings.TrimPrefix(c.ParentName, `\`)) {
+				if _, ok := vm.declaredClassByName(c.ParentName, false); !ok {
+					return true
+				}
+			} else if !vm.classDeclared(p) {
+				return true
+			}
+		}
+	}
+	for _, t := range c.Traits {
+		if _, ok := vm.declaredClassByName(t, false); !ok {
+			return true
+		}
+	}
+	// PHP déclare à l'exécution de son instruction une classe dont une interface n'est pas encore connue : un fichier inclus ou l'autoloader peut la fournir avant.
+	for _, iname := range c.Interfaces {
+		if !vm.interfaceReady(iname) {
+			return true
+		}
+	}
+	return false
+}
+
+// mainPendingEntry situe une classe du programme principal mise en attente : fichier principal et ligne de sa déclaration relue.
+func (vm *VM) mainPendingEntry(c *bytecode.ClassProto) pendingClass {
+	// Une classe anonyme n'est déclarée qu'à l'exécution de son new class, jamais au niveau du fichier.
+	entry := pendingClass{id: c.ID, topLevel: c.Flags&bytecode.ClassAnonymous == 0}
+	if vm.Program != nil && vm.Program.Main != nil {
+		entry.file = vm.Program.Main.Filename
+	}
+	if !vm.mainDeclDone {
+		vm.mainDeclDone = true
+		vm.mainDecl = mainFileDeclarations(vm.Program.Main)
+	}
+	if vm.mainDecl != nil {
+		if site, ok := vm.mainDecl.classes[strings.ToLower(strings.TrimPrefix(c.Name, `\`))]; ok {
+			entry.line = site.line
+			entry.topLevel = site.topLevel
+		}
+	}
+	return entry
+}
+
+// mainDeclares classe un prototype du programme principal : non vide, ou d'identifiant inférieur à celui d'une déclaration non vide (le compilateur alloue les déclarations avant les références), ou nommé par une déclaration du fichier principal relu.
+func (vm *VM) mainDeclares(c *bytecode.ClassProto) bool {
+	if !classIsPlaceholder(c) {
+		return true
+	}
+	if vm.Program == nil {
+		return false
+	}
+	for _, list := range [][]*bytecode.ClassProto{vm.Program.Classes, vm.Program.Traits} {
+		for _, other := range list {
+			if other != nil && other.ID > c.ID && !classIsPlaceholder(other) {
+				return true
+			}
+		}
+	}
+	if !vm.mainDeclDone {
+		vm.mainDeclDone = true
+		vm.mainDecl = mainFileDeclarations(vm.Program.Main)
+	}
+	if vm.mainDecl == nil {
+		return true
+	}
+	_, ok := vm.mainDecl.classes[strings.ToLower(c.Name)]
+	return ok
+}
+
+// declaredClassByName cherche une classe déclarée par son nom ou un alias ; autoload déclenche les déclarations en attente puis la chaîne spl_autoload_register.
+func (vm *VM) declaredClassByName(name string, autoload bool) (*bytecode.ClassProto, bool) {
+	name = strings.TrimPrefix(name, `\`)
+	if name == "" {
+		return nil, false
+	}
+	look := func() (*bytecode.ClassProto, bool) {
+		id, ok := vm.resolveName(name)
+		if !ok {
+			return nil, false
+		}
+		if _, builtin := bytecode.BuiltinClassName(id); builtin {
+			if bp := builtinProto(id); bp != nil {
+				return bp, true
+			}
+			return &bytecode.ClassProto{ID: id, Name: name}, true
+		}
+		c := vm.classByID(id)
+		if c == nil || !vm.classDeclared(c) {
+			return nil, false
+		}
+		return c, true
+	}
+	if c, ok := look(); ok {
+		return c, true
+	}
+	if !autoload || vm.stop {
+		return nil, false
+	}
+	if vm.bindPendingNamed(name) {
+		if c, ok := look(); ok {
+			return c, true
+		}
+	}
+	if vm.autoloadClass(name) {
+		return look()
+	}
+	return nil, false
 }
 
 func (vm *VM) isExceptionFamily(id uint32) bool {
@@ -1390,6 +1772,24 @@ func builtinProto(id uint32) *bytecode.ClassProto {
 		return &bytecode.ClassProto{Name: "JsonSerializable", ID: id, Kind: bytecode.KindInterface}
 	case bytecode.ClassStringable:
 		return &bytecode.ClassProto{Name: "Stringable", ID: id, Kind: bytecode.KindInterface}
+	case bytecode.ClassMysqli:
+		return &bytecode.ClassProto{Name: "mysqli", ID: id}
+	case bytecode.ClassMysqliResult:
+		return &bytecode.ClassProto{Name: "mysqli_result", ID: id, Interfaces: []string{"IteratorAggregate", "Traversable"}}
+	case bytecode.ClassMysqliStmt:
+		return &bytecode.ClassProto{Name: "mysqli_stmt", ID: id}
+	case bytecode.ClassMysqliDriver:
+		return &bytecode.ClassProto{Name: "mysqli_driver", ID: id, Flags: bytecode.ClassFinal}
+	case bytecode.ClassMysqliSqlException:
+		return &bytecode.ClassProto{Name: "mysqli_sql_exception", ID: id, ParentID: bytecode.ClassRuntimeException, Flags: bytecode.ClassFinal}
+	case bytecode.ClassGdImage:
+		return &bytecode.ClassProto{Name: "GdImage", ID: id, Flags: bytecode.ClassFinal}
+	case bytecode.ClassFinfo:
+		return &bytecode.ClassProto{Name: "finfo", ID: id}
+	case bytecode.ClassCurlHandle:
+		return &bytecode.ClassProto{Name: "CurlHandle", ID: id, Flags: bytecode.ClassFinal}
+	case bytecode.ClassXMLParser:
+		return &bytecode.ClassProto{Name: "XMLParser", ID: id, Flags: bytecode.ClassFinal}
 	default:
 		return nil
 	}

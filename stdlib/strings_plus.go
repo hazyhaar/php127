@@ -2613,7 +2613,8 @@ func replaceFoldAll(s, old, repl string) string {
 	return b.String()
 }
 
-func replaceStringFold(z *zone.Zone, search, repl types.Value, subject string) (string, error) {
+// replaceStringFold remplace sans tenir compte de la casse ASCII ; le nombre de remplacements s'ajoute à count.
+func replaceStringFold(z *zone.Zone, search, repl types.Value, subject string, count *int64) (string, error) {
 	if search.Type == types.TypeArray {
 		_, sv := arrayItems(z, search)
 		var rv []types.Value
@@ -2642,6 +2643,7 @@ func replaceStringFold(z *zone.Zone, search, repl types.Value, subject string) (
 			if ss == "" {
 				continue
 			}
+			*count += int64(strings.Count(asciiLowerString(subject), asciiLowerString(ss)))
 			subject = replaceFoldAll(subject, ss, rs)
 		}
 		return subject, nil
@@ -2657,6 +2659,7 @@ func replaceStringFold(z *zone.Zone, search, repl types.Value, subject string) (
 	if ss == "" {
 		return subject, nil
 	}
+	*count += int64(strings.Count(asciiLowerString(subject), asciiLowerString(ss)))
 	return replaceFoldAll(subject, ss, rs), nil
 }
 
@@ -2667,6 +2670,7 @@ func nativeStrIreplace(z *zone.Zone, _ io.Writer, args []types.Value) (types.Val
 	search := deref(z, args[0])
 	repl := deref(z, args[1])
 	subj := deref(z, args[2])
+	var count int64
 	if subj.Type == types.TypeArray {
 		out, err := newArray(z)
 		if err != nil {
@@ -2679,7 +2683,7 @@ func nativeStrIreplace(z *zone.Zone, _ io.Writer, args []types.Value) (types.Val
 				types.ReleaseValue(z, &out)
 				return types.Value{}, err
 			}
-			rep, err := replaceStringFold(z, search, repl, s)
+			rep, err := replaceStringFold(z, search, repl, s, &count)
 			if err != nil {
 				types.ReleaseValue(z, &out)
 				return types.Value{}, err
@@ -2696,16 +2700,18 @@ func nativeStrIreplace(z *zone.Zone, _ io.Writer, args []types.Value) (types.Val
 				return types.Value{}, err
 			}
 		}
+		storeReplaceCount(z, args, count)
 		return out, nil
 	}
 	s, err := asStringParam(z, subj, "str_ireplace", "3", "subject")
 	if err != nil {
 		return types.Value{}, err
 	}
-	out, err := replaceStringFold(z, search, repl, s)
+	out, err := replaceStringFold(z, search, repl, s, &count)
 	if err != nil {
 		return types.Value{}, err
 	}
+	storeReplaceCount(z, args, count)
 	return newStr(z, out)
 }
 
@@ -3109,42 +3115,6 @@ func nativeUtf8Encode(z *zone.Zone, _ io.Writer, args []types.Value) (types.Valu
 	return newStr(z, b.String())
 }
 
-func nativeMbConvertEncoding(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("mb_convert_encoding", len(args), 2, 3); err != nil {
-		return types.Value{}, err
-	}
-	s, err := asStringParam(z, args[0], "mb_convert_encoding", "1", "string")
-	if err != nil {
-		return types.Value{}, err
-	}
-	return newStr(z, s)
-}
-
-func nativeMbCheckEncoding(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("mb_check_encoding", len(args), 0, 2); err != nil {
-		return types.Value{}, err
-	}
-	if len(args) == 0 || deref(z, args[0]).IsNull() || deref(z, args[0]).IsUndef() {
-		return types.NewBool(true), nil
-	}
-	s, err := asStringParam(z, args[0], "mb_check_encoding", "1", "value")
-	if err != nil {
-		return types.Value{}, err
-	}
-	return types.NewBool(utf8.ValidString(s)), nil
-}
-
-func nativeIconv(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("iconv", len(args), 3, 3); err != nil {
-		return types.Value{}, err
-	}
-	s, err := asStringParam(z, args[2], "iconv", "3", "string")
-	if err != nil {
-		return types.Value{}, err
-	}
-	return newStr(z, s)
-}
-
 func nativeNlLanginfo(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
 	if err := arity("nl_langinfo", len(args), 1, 1); err != nil {
 		return types.Value{}, err
@@ -3174,4 +3144,3 @@ func nativeLocaleconv(z *zone.Zone, _ io.Writer, args []types.Value) (types.Valu
 	types.ReleaseValue(z, &v)
 	return out, nil
 }
-

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"code.hazyhaar.fr/devhoros/php127/bytecode"
+	"code.hazyhaar.fr/devhoros/php127/stdlib"
 	"code.hazyhaar.fr/devhoros/php127/types"
 	"code.hazyhaar.fr/devhoros/php127/zone"
 )
@@ -129,6 +130,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if rec := recover(); rec != nil && !reqCtx.HeadersSent {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
+		stdlib.CleanupUploadedFiles(z)
 		BindContext(z, nil)
 		z.Reset(func(item zone.CleanupItem) {
 			types.DispatchObjectDestructor(z, item)

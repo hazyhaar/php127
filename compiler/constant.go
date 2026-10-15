@@ -157,6 +157,9 @@ func (e *emitter) constant(x ast.Expr) *bc.Constant {
 	if x == nil {
 		return &bc.Constant{Value: types.NewNull()}
 	}
+	if !e.staticConst(x) {
+		return e.thunkConst(x)
+	}
 	switch n := x.(type) {
 	case *ast.ArrayExpr:
 		c := &bc.Constant{IsArray: true, Items: make([]bc.ConstantItem, 0, len(n.Items))}
@@ -202,31 +205,11 @@ func (e *emitter) constant(x ast.Expr) *bc.Constant {
 					return &bc.Constant{Text: e.class.ParentName, IsString: true}
 				}
 			}
-			return &bc.Constant{Text: strings.TrimPrefix(cname, `\`), IsString: true}
+			return &bc.Constant{Text: e.className(n.Class), IsString: true}
 		}
-		var target *bc.ClassProto
-		switch strings.ToLower(cname) {
-		case "self", "static":
-			target = e.class
-		case "parent":
-			if e.class != nil {
-				target = e.classes[strings.ToLower(strings.TrimPrefix(e.class.ParentName, `\`))]
-			}
-		default:
-			target = e.classes[strings.ToLower(strings.TrimPrefix(cname, `\`))]
-		}
-		for cur := target; cur != nil; cur = e.classes[strings.ToLower(strings.TrimPrefix(cur.ParentName, `\`))] {
-			for _, cst := range cur.Constants {
-				if cst.Name == mname && cst.Initial != nil {
-					cp := *cst.Initial
-					return &cp
-				}
-			}
-			if cur.ParentName == "" {
-				break
-			}
-		}
-		return &bc.Constant{Value: types.NewLong(0)}
+		cst, _ := e.compileTimeClassConst(n)
+		cp := *cst
+		return &cp
 	case *ast.UnaryExpr:
 		c := e.constant(n.Expr)
 		switch n.Op {
@@ -391,9 +374,106 @@ func (e *emitter) constant(x ast.Expr) *bc.Constant {
 			}
 		}
 		return &bc.Constant{Value: types.NewNull()}
-	case *ast.NewExpr:
-		return &bc.Constant{Value: types.NewNull()}
 	}
 	v, s, text := e.literal(x)
 	return &bc.Constant{Value: v, Text: s, IsString: text}
+}
+
+// compileTimeLiteralConsts énumère les constantes globales dont la compilation connaît la valeur ; toute autre
+// constante globale est résolue à l'exécution.
+var compileTimeLiteralConsts = map[string]bool{
+	"null": true, "true": true, "false": true, "php_int_max": true, "php_int_min": true, "php_int_size": true,
+	"php_eol": true, "directory_separator": true, "path_separator": true, "nan": true, "inf": true,
+}
+
+// compileTimeClassConst cherche Classe::NOM dans les classes du fichier compilé, en remontant les parents ;
+// faux si la constante, sa classe ou un ascendant ne sont connus qu'à l'exécution.
+func (e *emitter) compileTimeClassConst(n *ast.ClassConstFetchExpr) (*bc.Constant, bool) {
+	cname := e.name(n.Class)
+	mname := e.name(n.Const)
+	var target *bc.ClassProto
+	switch strings.ToLower(cname) {
+	case "self":
+		target = e.class
+	case "static":
+		return nil, false
+	case "parent":
+		if e.class != nil {
+			target = e.classes[strings.ToLower(strings.TrimPrefix(e.class.ParentName, `\`))]
+		}
+	default:
+		if _, isVar := n.Class.(*ast.VarExpr); isVar {
+			return nil, false
+		}
+		target = e.classes[strings.ToLower(e.className(n.Class))]
+	}
+	for cur := target; cur != nil; cur = e.classes[strings.ToLower(strings.TrimPrefix(cur.ParentName, `\`))] {
+		for _, cst := range cur.Constants {
+			if cst.Name == mname && cst.Initial != nil {
+				return cst.Initial, cst.Initial.Thunk == nil
+			}
+		}
+		if cur.ParentName == "" {
+			break
+		}
+	}
+	return nil, false
+}
+
+// staticConst indique si la compilation peut évaluer l'expression constante x entièrement.
+func (e *emitter) staticConst(x ast.Expr) bool {
+	switch n := x.(type) {
+	case nil:
+		return true
+	case *ast.IntLit, *ast.FloatLit, *ast.StringLit, *ast.MagicConstExpr:
+		return true
+	case *ast.ConstFetchExpr:
+		return compileTimeLiteralConsts[strings.ToLower(strings.TrimPrefix(n.Name, `\`))]
+	case *ast.EncapsedStringExpr:
+		for _, part := range n.Parts {
+			if !e.staticConst(part) {
+				return false
+			}
+		}
+		return true
+	case *ast.ArrayExpr:
+		for _, item := range n.Items {
+			if item.Value != nil && !e.staticConst(item.Value) || item.Key != nil && !e.staticConst(item.Key) {
+				return false
+			}
+		}
+		return true
+	case *ast.ClassConstFetchExpr:
+		if strings.EqualFold(e.name(n.Const), "class") {
+			_, isVar := n.Class.(*ast.VarExpr)
+			return !isVar && !strings.EqualFold(e.name(n.Class), "static")
+		}
+		_, ok := e.compileTimeClassConst(n)
+		return ok
+	case *ast.UnaryExpr:
+		return e.staticConst(n.Expr)
+	case *ast.BinaryExpr:
+		return e.staticConst(n.Left) && e.staticConst(n.Right)
+	case *ast.TernaryExpr:
+		return e.staticConst(n.Cond) && (n.If == nil || e.staticConst(n.If)) && e.staticConst(n.Else)
+	case *ast.DimFetchExpr:
+		return e.staticConst(n.Var) && n.Dim != nil && e.staticConst(n.Dim)
+	}
+	return false
+}
+
+// thunkConst compile l'expression constante x en une fonction sans paramètre que la VM exécute à chaque
+// évaluation, dans la portée de la classe déclarante ; une constante absente lève alors l'erreur de PHP.
+func (e *emitter) thunkConst(x ast.Expr) *bc.Constant {
+	child := e.compilation.emitter(bc.ConstantThunkName)
+	child.namespace, child.uses, child.class = e.namespace, e.uses, e.class
+	child.expr(x)
+	child.emit(bc.OpReturn, 0, 0, 0)
+	child.end()
+	e.prog.Funcs = append(e.prog.Funcs, child.fn)
+	c := &bc.Constant{Thunk: child.fn}
+	if e.class != nil {
+		c.ThunkScope = e.class.Name
+	}
+	return c
 }

@@ -190,6 +190,43 @@ func TestDiagnostics(t *testing.T) {
 	}
 }
 
+// TestAnonymousClassPromotedConstructor compare à php -l le constructeur à propriétés promues d'une classe anonyme,
+// dans et hors d'un espace de noms, et les diagnostics qui nomment class@anonymous.
+func TestAnonymousClassPromotedConstructor(t *testing.T) {
+	for _, src := range []string{
+		`$o = new class(42, 'ok') { public function __construct(public int $a, private string $b) {} };`,
+		`namespace N; $o = new class(1) { public function __construct(public readonly int $a) {} };`,
+		`$o = new class(1) extends P { public function __construct(protected ?int $a = null) { parent::__construct(); } };`,
+		`$o = new class { public function f(public int $a) {} };`,
+		`namespace N; $o = new class { function f() {} function f() {} };`,
+		`$o = new class { abstract function f() {} };`,
+		`interface I {} $o = new class extends P implements I { function f() {} function f() {} };`,
+		`namespace N; interface I {} $o = new class implements I { function f() {} function f() {} };`,
+		`namespace N; $o = new class extends \Q\P { function f() {} function f() {} };`,
+		`final class F {} $o = new class extends F {};`,
+		`interface I { function i(); } $o = new class implements I { function i() {} #[\Override] function c() {} };`,
+		`$o = new class { #[\Override] function f() {} };`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			category, line, message := oracle(t, "<?php "+src)
+			_, err := Parse("<?php "+src, "Standard input code")
+			if category == "" {
+				if err != nil {
+					t.Fatalf("Source acceptee par PHP, refusee par le parseur : %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Source acceptee a tort ; PHP=%s:%d: %s", category, line, message)
+			}
+			want := fmt.Sprintf("%s: %s in Standard input code on line %d", category, message, line)
+			if err.Error() != want {
+				t.Errorf("recu: %s\nattendu: %s", err, want)
+			}
+		})
+	}
+}
+
 func TestMutations(t *testing.T) {
 	for _, mutation := range []struct{ name, file, old, replacement, test string }{
 		{"guard", "parser.go", "p.cursor <= before", "false", "TestProgressGuard"},

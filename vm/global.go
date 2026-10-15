@@ -13,7 +13,7 @@ func (vm *VM) globalSnapshot() types.Value {
 		return arr
 	}
 	put := func(name string, value types.Value) {
-		if value.IsUndef() || name == "GLOBALS" || strings.HasPrefix(name, "\x00") {
+		if value.IsUndef() || types.Deref(vm.Zone, value).IsUndef() || name == "GLOBALS" || strings.HasPrefix(name, "\x00") {
 			return
 		}
 		key, err := types.NewStringLiteral(vm.Zone, name)

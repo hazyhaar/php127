@@ -121,6 +121,11 @@ func checkOperands(fn *OpArray, pc int, in Instr) error {
 		}
 		return nil
 	}
+	if idx, dynamic := ClassOperandCV(in); dynamic {
+		if err := cv(idx); err != nil {
+			return err
+		}
+	}
 	switch in.Op {
 	case OpYield, OpYieldFrom:
 		if !fn.IsGenerator {

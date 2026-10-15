@@ -3,8 +3,10 @@ package vm
 import (
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"code.hazyhaar.fr/devhoros/php127/bytecode"
 	"code.hazyhaar.fr/devhoros/php127/datetime"
@@ -12,6 +14,7 @@ import (
 	"code.hazyhaar.fr/devhoros/php127/sapi"
 	"code.hazyhaar.fr/devhoros/php127/session"
 	"code.hazyhaar.fr/devhoros/php127/stdlib"
+	"code.hazyhaar.fr/devhoros/php127/streams"
 	"code.hazyhaar.fr/devhoros/php127/types"
 	"code.hazyhaar.fr/devhoros/php127/zone"
 )
@@ -33,9 +36,18 @@ func (vm *VM) initSuperglobals() {
 				src = sapiCtx.RequestVars
 			case "_SERVER":
 				src = sapiCtx.Server
+			case "_FILES":
+				src = sapiCtx.Files
 			}
 			if !src.IsUndef() && src.Type == types.TypeArray {
 				types.AssignRef(vm.Zone, ref, src)
+				continue
+			}
+		}
+		if name == "_SERVER" && vm.Context != nil && vm.Context.CLIArgv != nil {
+			if srv, err := sapi.CLIServer(vm.Zone, vm.Context.CLIArgv, os.Environ(), vm.Context.CLIInline, time.Now()); err == nil {
+				types.AssignRef(vm.Zone, ref, srv)
+				types.ReleaseValue(vm.Zone, &srv)
 				continue
 			}
 		}
@@ -50,10 +62,57 @@ func (vm *VM) initSuperglobals() {
 	}
 }
 
+// seedCLIGlobals pose $argv et $argc dans la portée globale du programme principal, comme register_argc_argv
+// de la SAPI CLI : variable compilée du cadre racine si le script la nomme, table des globales sinon, où les
+// lisent $GLOBALS, global et les fichiers inclus.
+func (vm *VM) seedCLIGlobals() {
+	if vm.Context == nil || vm.Context.CLIArgv == nil || len(vm.frames) != 1 {
+		return
+	}
+	argv, err := types.NewArray(vm.Zone)
+	if err != nil {
+		vm.fatalFeature("argv")
+		return
+	}
+	for _, a := range vm.Context.CLIArgv {
+		s, err := types.NewString(vm.Zone, a, 0)
+		if err == nil {
+			err = types.ArrayAppend(vm.Zone, &argv, s)
+			types.ReleaseValue(vm.Zone, &s)
+		}
+		if err != nil {
+			types.ReleaseValue(vm.Zone, &argv)
+			vm.fatalFeature("argv")
+			return
+		}
+	}
+	vm.setRootGlobal("argv", argv)
+	vm.setRootGlobal("argc", types.NewLong(int64(len(vm.Context.CLIArgv))))
+}
+
+// setRootGlobal transfère v dans la variable globale name du cadre racine.
+func (vm *VM) setRootGlobal(name string, v types.Value) {
+	root := &vm.frames[0]
+	if idx, ok := vm.findCVIndex(root.fn, name); ok {
+		slot := &vm.slots[root.cvBase+int(idx)]
+		vmRelease(vm.Zone, slot)
+		*slot = v
+		return
+	}
+	if old, ok := vm.globals[name]; ok {
+		vmRelease(vm.Zone, &old)
+	}
+	vm.globals[name] = v
+}
+
 func (vm *VM) preNativeCallSync(name string) {
 	switch strings.ToLower(strings.TrimPrefix(name, `\`)) {
 	case "session_write_close", "session_commit", "session_encode":
 		vm.syncSessionBeforeClose()
+	case "stream_wrapper_register", "stream_register_wrapper":
+		if vm.Zone != nil {
+			streams.SetWrapperOpener(vm.Zone, vm.openUserWrapperStream)
+		}
 	}
 }
 
@@ -817,7 +876,7 @@ func (p *vmReflectionProvider) ResolveFunction(name string) (*reflection.Functio
 	clean := strings.TrimPrefix(name, `\`)
 	if p.vm.Program != nil {
 		for _, fn := range p.vm.Program.Funcs {
-			if fn != nil && strings.EqualFold(fn.Name, clean) {
+			if fn != nil && !bytecode.AnonymousFunc(fn.Name) && strings.EqualFold(fn.Name, clean) {
 				return p.vm.buildFunctionMeta(fn), true
 			}
 		}
@@ -932,6 +991,7 @@ func (vm *VM) buildClassMeta(c *bytecode.ClassProto) *reflection.ClassMeta {
 		IsAbstract:  c.Flags&bytecode.ClassAbstract != 0,
 		IsFinal:     c.Flags&bytecode.ClassFinal != 0,
 		IsReadOnly:  c.Flags&bytecode.ClassReadonly != 0,
+		IsAnonymous: c.Flags&bytecode.ClassAnonymous != 0,
 		BackingType: reflection.ParseTypeString(c.BackingType),
 		Attributes:  vm.convertAttrs(c.Attributes),
 	}
@@ -2583,7 +2643,7 @@ func (vm *VM) appendEnumAwareDump(buf *strings.Builder, v types.Value, indent in
 				case bytecode.VisProtected:
 					k = fmt.Sprintf("%q:protected", p.Name)
 				case bytecode.VisPrivate:
-					k = fmt.Sprintf("%q:%q:private", p.Name, vm.className(p.ClassID))
+					k = fmt.Sprintf("%q:%q:private", p.Name, displayClassName(vm.className(p.ClassID)))
 				default:
 					k = fmt.Sprintf("%q", p.Name)
 				}
@@ -2614,7 +2674,7 @@ func (vm *VM) appendEnumAwareDump(buf *strings.Builder, v types.Value, indent in
 							case bytecode.VisProtected:
 								k = fmt.Sprintf("%q:protected", p.Name)
 							case bytecode.VisPrivate:
-								k = fmt.Sprintf("%q:%q:private", p.Name, vm.className(cur.ID))
+								k = fmt.Sprintf("%q:%q:private", p.Name, displayClassName(vm.className(cur.ID)))
 							default:
 								k = fmt.Sprintf("%q", p.Name)
 							}
@@ -2639,7 +2699,7 @@ func (vm *VM) appendEnumAwareDump(buf *strings.Builder, v types.Value, indent in
 			})
 		}
 		buf.WriteString(pad)
-		buf.WriteString(fmt.Sprintf("object(%s)#%d (%d) {\n", vm.className(info.ClassID), v.DataSlot+1, len(props)))
+		buf.WriteString(fmt.Sprintf("object(%s)#%d (%d) {\n", displayClassName(vm.className(info.ClassID)), v.DataSlot+1, len(props)))
 		for _, pr := range props {
 			buf.WriteString(pad)
 			buf.WriteString("  [")

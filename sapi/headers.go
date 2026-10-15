@@ -24,11 +24,11 @@ type HeaderEntry struct {
 // RequestContext porte l'état HTTP associé à une Zone de requête pendant ServeHTTP.
 type RequestContext struct {
 	Request      *http.Request
-	RawInput     []byte
 	Server       types.Value
 	Get          types.Value
 	Post         types.Value
 	Cookie       types.Value
+	Files        types.Value
 	RequestVars  types.Value
 	StatusCode   int
 	Headers      []HeaderEntry

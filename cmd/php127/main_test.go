@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -95,7 +96,7 @@ echo $_SERVER["REQUEST_METHOD"], "|",
 		t.Fatal(err)
 	}
 	var errBuf bytes.Buffer
-	srv, err := buildHTTPServer("127.0.0.1:0", docRoot, "", &errBuf)
+	srv, err := buildHTTPServer("127.0.0.1:0", docRoot, "", &errBuf, nil, cliZoneCapacity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,3 +320,124 @@ var_dump(ob_get_clean());
 	}
 }
 
+// TestCLIServerArgvMatchesPHP compare à php -n les clés de $_SERVER que la SAPI CLI ajoute à l'environnement :
+// script tel que nommé, arguments, argc, DOCUMENT_ROOT vide.
+func TestCLIServerArgvMatchesPHP(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "srv.php")
+	src := `<?php
+foreach (["PHP_SELF", "SCRIPT_NAME", "SCRIPT_FILENAME", "PATH_TRANSLATED", "DOCUMENT_ROOT", "argc"] as $k) {
+	echo $k, "=", var_export($_SERVER[$k] ?? "ABSENT", true), "\n";
+}
+var_dump($_SERVER["argv"], is_float($_SERVER["REQUEST_TIME_FLOAT"]), is_int($_SERVER["REQUEST_TIME"]));
+`
+	if err := os.WriteFile(script, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), "/usr/bin/php", "-n", "srv.php", "a", "b")
+	cmd.Dir = dir
+	want, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	var gotOut, gotErr bytes.Buffer
+	if code := run([]string{"srv.php", "a", "b"}, strings.NewReader(""), &gotOut, &gotErr); code != 0 {
+		t.Fatalf("code %d, stderr %q", code, gotErr.String())
+	}
+	if gotOut.String() != string(want) {
+		t.Fatalf("$_SERVER CLI :\nobtenu %q\nattendu %q", gotOut.String(), want)
+	}
+}
+
+// TestCLIDirectivesArgvArgcMatchPHP compare à php -n les directives -d (valeur maîtresse rendue par ini_get,
+// rétablie par ini_restore, publiée en global_value, clé inconnue ignorée), $argv et $argc dans la portée
+// globale, une fonction, $GLOBALS et un fichier inclus, et les arguments de -r avec ou sans --.
+func TestCLIDirectivesArgvArgcMatchPHP(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	write("inc.php", `<?php var_dump($argc, $argv[0] === $_SERVER["argv"][0]);`)
+	argv := write("argv.php", `<?php
+var_dump($argc, $argv);
+function f() { var_dump(isset($argv), $GLOBALS["argc"], $GLOBALS["argv"][1] ?? null); global $argv; var_dump(count($argv)); }
+f();
+require __DIR__ . '/inc.php';
+var_dump(count($_SERVER["argv"]), $_SERVER["argc"]);
+`)
+	globals := write("globals.php", `<?php
+function g() { var_dump($GLOBALS["argv"], $GLOBALS["argc"]); }
+g();
+`)
+	ini := write("ini.php", `<?php
+var_dump(ini_get("precision"), ini_get("foo"), ini_get("display_errors"), ini_get("memory_limit"), error_reporting());
+ini_set("precision", "9");
+ini_restore("precision");
+var_dump(ini_get("precision"), ini_get_all(null, true)["precision"], ini_get_all(null, true)["memory_limit"]["global_value"]);
+`)
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"argv", []string{"-n", argv, "un", "deux", "-x"}},
+		{"argv-sans-argument", []string{"-n", argv}},
+		{"entree-standard-apres-double-tiret", []string{"-n", "--", "a", "-b"}},
+		{"globals", []string{"-n", globals, "z"}},
+		{"directives", []string{"-n", "-d", "precision=5", "-dfoo=bar", "-d", "display_errors", "-d", "memory_limit=96M", "-d", "error_reporting=0", ini}},
+		{"directive-repetee", []string{"-n", "-d", "precision=3", "-d", "precision=7", ini}},
+		{"r-arguments", []string{"-n", "-r", `var_dump($argv, $argc);`, "a", "b"}},
+		{"r-double-tiret", []string{"-n", "-r", `var_dump($argv, $argc);`, "--", "a", "b"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotOut, gotErr, wantOut, wantErr bytes.Buffer
+			stdin := `<?php var_dump($argv, $argc);`
+			cmd := exec.CommandContext(t.Context(), "/usr/bin/php", tc.args...)
+			cmd.Stdin = strings.NewReader(stdin)
+			cmd.Stdout = &wantOut
+			cmd.Stderr = &wantErr
+			if err := cmd.Run(); err != nil && cmd.ProcessState == nil {
+				t.Fatal(err)
+			}
+			code := run(tc.args, strings.NewReader(stdin), &gotOut, &gotErr)
+			if code != cmd.ProcessState.ExitCode() || gotOut.String() != wantOut.String() || gotErr.String() != wantErr.String() {
+				t.Fatalf("got (%q,%q,%d)\nwant (%q,%q,%d)", gotOut.String(), gotErr.String(), code, wantOut.String(), wantErr.String(), cmd.ProcessState.ExitCode())
+			}
+		})
+	}
+}
+
+// TestZoneCapacityFromMemoryLimit vérifie le dimensionnement de la Zone par -d memory_limit : suffixes K, M et G,
+// borne de la capacité adressable, valeur illimitée ou illisible ramenée à la capacité par défaut.
+func TestZoneCapacityFromMemoryLimit(t *testing.T) {
+	for _, tc := range []struct {
+		limit string
+		want  uint32
+	}{
+		{"128M", 128 << 20},
+		{"96m", 96 << 20},
+		{"512K", 512 << 10},
+		{"1G", 1 << 30},
+		{"8G", math.MaxUint32 &^ 7},
+		{"134217733", 134217728},
+		{"-1", cliZoneCapacity},
+		{"0", cliZoneCapacity},
+		{"illisible", cliZoneCapacity},
+		{"", cliZoneCapacity},
+	} {
+		var overrides map[string]string
+		if tc.limit != "" {
+			overrides = parseDirectives([]string{"memory_limit=" + tc.limit})
+		}
+		if got := zoneCapacityFor(overrides); got != tc.want {
+			t.Fatalf("memory_limit=%q : capacité %d, attendu %d", tc.limit, got, tc.want)
+		}
+	}
+	if got := parseDirectives([]string{"display_errors", "a=b=c", "=x"}); len(got) != 2 || got["display_errors"] != "1" || got["a"] != "b=c" {
+		t.Fatalf("directives découpées %v", got)
+	}
+}

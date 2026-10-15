@@ -57,16 +57,24 @@ func cmpFold(name, canon string) int {
 func Constants() map[string]types.Value { return constants }
 
 var constants = map[string]types.Value{
-	"PHP_URL_SCHEME":    types.NewLong(PHP_URL_SCHEME),
-	"PHP_URL_HOST":      types.NewLong(PHP_URL_HOST),
-	"PHP_URL_PORT":      types.NewLong(PHP_URL_PORT),
-	"PHP_URL_USER":      types.NewLong(PHP_URL_USER),
-	"PHP_URL_PASS":      types.NewLong(PHP_URL_PASS),
-	"PHP_URL_PATH":      types.NewLong(PHP_URL_PATH),
-	"PHP_URL_QUERY":     types.NewLong(PHP_URL_QUERY),
-	"PHP_URL_FRAGMENT":  types.NewLong(PHP_URL_FRAGMENT),
-	"PHP_QUERY_RFC1738": types.NewLong(PHP_QUERY_RFC1738),
-	"PHP_QUERY_RFC3986": types.NewLong(PHP_QUERY_RFC3986),
+	"PHP_URL_SCHEME":        types.NewLong(PHP_URL_SCHEME),
+	"PHP_URL_HOST":          types.NewLong(PHP_URL_HOST),
+	"PHP_URL_PORT":          types.NewLong(PHP_URL_PORT),
+	"PHP_URL_USER":          types.NewLong(PHP_URL_USER),
+	"PHP_URL_PASS":          types.NewLong(PHP_URL_PASS),
+	"PHP_URL_PATH":          types.NewLong(PHP_URL_PATH),
+	"PHP_URL_QUERY":         types.NewLong(PHP_URL_QUERY),
+	"PHP_URL_FRAGMENT":      types.NewLong(PHP_URL_FRAGMENT),
+	"PHP_QUERY_RFC1738":     types.NewLong(PHP_QUERY_RFC1738),
+	"PHP_QUERY_RFC3986":     types.NewLong(PHP_QUERY_RFC3986),
+	"UPLOAD_ERR_OK":         types.NewLong(0),
+	"UPLOAD_ERR_INI_SIZE":   types.NewLong(1),
+	"UPLOAD_ERR_FORM_SIZE":  types.NewLong(2),
+	"UPLOAD_ERR_PARTIAL":    types.NewLong(3),
+	"UPLOAD_ERR_NO_FILE":    types.NewLong(4),
+	"UPLOAD_ERR_NO_TMP_DIR": types.NewLong(6),
+	"UPLOAD_ERR_CANT_WRITE": types.NewLong(7),
+	"UPLOAD_ERR_EXTENSION":  types.NewLong(8),
 }
 
 func init() {

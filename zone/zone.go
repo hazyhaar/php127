@@ -8,10 +8,33 @@ import (
 	"errors"
 	"math"
 	"math/bits"
+	"os"
+	"path/filepath"
+	"strings"
 	"unsafe"
 )
 
 const DefaultCapacity uint32 = 2 << 20
+
+// DefaultUmask est le masque de création initial de chaque Zone PHP.
+const DefaultUmask = 0o022
+
+// MaxSlots bounds the per-Zone state slots reserved for extension packages.
+const MaxSlots = 16
+
+// Slot indexes owned by engine packages. Each package stores its per-request
+// state in its own slot only; Reset clears every slot after the cleanup drain.
+const (
+	SlotStreams = 0
+	SlotExt     = 1
+	SlotStdlib  = 2
+	SlotMySQLi  = 3
+	SlotPDO     = 4
+	SlotVM      = 5
+)
+
+// poisonByte fills released payload bytes when poisoning is enabled.
+const poisonByte = 0xAA
 
 var (
 	ErrExhausted     = errors.New("zone: capacity exhausted")
@@ -40,6 +63,11 @@ type Zone struct {
 	objectTail uint32
 	objectUsed uint32
 	epoch      uint32
+	poison     bool
+	cwd        string
+	umask      int
+	umaskSet   bool
+	slots      [MaxSlots]any
 }
 
 // New reserves capacity bytes, rounded down to a multiple of eight. Use
@@ -59,6 +87,26 @@ func New(capacity uint32) *Zone {
 		z.memory = unsafe.Slice((*byte)(unsafe.Pointer(&words[0])), len(words)*8)
 	}
 	return z
+}
+
+// Capacity rend la capacité totale de l'arène en octets.
+func (z *Zone) Capacity() uint32 {
+	if z == nil {
+		return 0
+	}
+	return uint32(len(z.memory))
+}
+
+// Grow étend la capacité de l'arène à au moins minCap octets en conservant le préfixe alloué et le curseur.
+// Réservé à la construction de la zone de processus avant son gel.
+func (z *Zone) Grow(minCap uint32) {
+	if z == nil || minCap <= uint32(len(z.memory)) {
+		return
+	}
+	words := make([]uint64, (uint64(minCap)+7)/8)
+	nextMem := unsafe.Slice((*byte)(unsafe.Pointer(&words[0])), len(words)*8)
+	copy(nextMem[:z.cursor], z.memory[:z.cursor])
+	z.memory = nextMem
 }
 
 // sizeClass widens before rounding so sizes near 4 GiB cannot wrap to zero.
@@ -114,6 +162,10 @@ func (z *Zone) Free(offset, size uint32) error {
 	}
 	// Keep a released object's reference count invalid, apart from the list link.
 	binary.LittleEndian.PutUint32(z.memory[offset:offset+4], 0)
+	// Poisoning precedes the link write and never touches the eight header bytes.
+	if z.poison && span > 8 {
+		fillPoison(z.memory[offset+8 : end])
+	}
 	if end == uint64(z.cursor) {
 		z.cursor = offset
 	} else if class >= 0 {
@@ -149,6 +201,89 @@ func (z *Zone) Offset(ptr *byte) (uint32, error) {
 	return uint32(address - base), nil
 }
 
+func fillPoison(b []byte) {
+	for i := range b {
+		b[i] = poisonByte
+	}
+}
+
+// SetPoisonOnFree makes Free overwrite released payload bytes beyond the
+// eight-byte free-list header with 0xAA, so stale views read poison at once.
+func (z *Zone) SetPoisonOnFree(enable bool) { z.poison = enable }
+
+// PoisonOnFree reports whether Free poisons released payload bytes.
+func (z *Zone) PoisonOnFree() bool { return z.poison }
+
+// Slot returns the extension state stored at id, or nil for a nil Zone or an
+// id outside [0, MaxSlots). Slots hold Go values outside the arena.
+func (z *Zone) Slot(id int) any {
+	if z == nil || id < 0 || id >= MaxSlots {
+		return nil
+	}
+	return z.slots[id]
+}
+
+// SetSlot stores extension state at id; out-of-range ids and nil Zones are ignored.
+// Reset clears every slot after the cleanup drain.
+func (z *Zone) SetSlot(id int, v any) {
+	if z == nil || id < 0 || id >= MaxSlots {
+		return
+	}
+	z.slots[id] = v
+}
+
+// Cwd rend le répertoire courant de la Zone, ou celui du processus si aucun chdir n'a eu lieu.
+func (z *Zone) Cwd() string {
+	if z != nil && z.cwd != "" {
+		return z.cwd
+	}
+	wd, _ := os.Getwd()
+	return wd
+}
+
+// SetCwd fixe le répertoire courant de la Zone à une copie indépendante de dir.
+func (z *Zone) SetCwd(dir string) {
+	if z == nil {
+		return
+	}
+	z.cwd = strings.Clone(dir)
+}
+
+// ResolvePath résout un chemin relatif contre le répertoire courant de la Zone.
+func (z *Zone) ResolvePath(p string) string {
+	if p == "" || filepath.IsAbs(p) {
+		return p
+	}
+	cwd := z.Cwd()
+	if cwd == "" {
+		return p
+	}
+	return filepath.Join(cwd, p)
+}
+
+// Umask rend le masque de création de la Zone (DefaultUmask par défaut).
+func (z *Zone) Umask() int {
+	if z == nil || !z.umaskSet {
+		return DefaultUmask
+	}
+	return z.umask
+}
+
+// SetUmask pose le masque de création de la Zone (sur 9 bits) et rend l'ancien masque.
+func (z *Zone) SetUmask(mask int) int {
+	old := z.Umask()
+	if z != nil {
+		z.umask = mask & 0o777
+		z.umaskSet = true
+	}
+	return old
+}
+
+// CreateMode rend perm privé du masque de création de la Zone.
+func (z *Zone) CreateMode(perm os.FileMode) os.FileMode {
+	return perm &^ os.FileMode(z.Umask()) & 0o777
+}
+
 func (z *Zone) RegisterCleanup(item CleanupItem) {
 	z.cleanups.RegisterCleanup(item)
 }
@@ -162,7 +297,7 @@ func (z *Zone) RunCleanups(dispatch func(CleanupItem)) {
 }
 
 // Reset drains cleanups while memory is live, invalidates issued object slots,
-// and rewinds the arena cursor and free lists in O(1).
+// rewinds the arena cursor and free lists in O(1), then clears state slots.
 // Neither memory nor registry capacity is cleared or freed. After dispatch
 // panics, draining and rewinding finish before the first panic is rethrown.
 // Invalid or recursive dispatch leaves memory and pending items unchanged.
@@ -178,6 +313,10 @@ func (z *Zone) Reset(dispatch func(CleanupItem)) {
 			z.objectUsed = 0
 			z.epoch++
 			z.cursor = 0
+			z.cwd = ""
+			z.umask = 0
+			z.umaskSet = false
+			clear(z.slots[:])
 			for i := range z.freeHead {
 				z.freeHead[i] = math.MaxUint32
 			}

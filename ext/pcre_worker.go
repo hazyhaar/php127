@@ -29,6 +29,17 @@ static PCRE2_SPTR8 php127_pcre2_name_table(const pcre2_code_8 *code) {
 	pcre2_pattern_info_8(code, PCRE2_INFO_NAMETABLE, &table);
 	return table;
 }
+
+// Contexte de correspondance aux limites par défaut de PHP 8.3 : pcre.backtrack_limit = 1000000,
+// pcre.recursion_limit = 100000. Il n'est que lu par pcre2_match, donc partageable entre fils.
+static pcre2_match_context_8 *php127_pcre2_match_context(void) {
+	pcre2_match_context_8 *ctx = pcre2_match_context_create_8(NULL);
+	if (ctx != NULL) {
+		pcre2_set_match_limit_8(ctx, 1000000);
+		pcre2_set_depth_limit_8(ctx, 100000);
+	}
+	return ctx;
+}
 */
 import "C"
 
@@ -53,6 +64,26 @@ type pcreCompiled struct {
 }
 
 var pcreCache sync.Map
+
+var pcreMatchContext = sync.OnceValue(func() *C.pcre2_match_context_8 { return C.php127_pcre2_match_context() })
+
+// pcreErrorCode traduit un code d'échec de pcre2_match en code de preg_last_error(), comme pcre_handle_exec_error.
+func pcreErrorCode(rc C.int) int64 {
+	switch {
+	case rc == C.PCRE2_ERROR_MATCHLIMIT:
+		return pregBacktrackLimitError
+	case rc == C.PCRE2_ERROR_DEPTHLIMIT:
+		return pregRecursionLimitError
+	case rc <= C.PCRE2_ERROR_UTF8_ERR1 && rc >= C.PCRE2_ERROR_UTF8_ERR21:
+		return pregBadUTF8Error
+	case rc == C.PCRE2_ERROR_BADUTFOFFSET:
+		return pregBadUTF8OffsetError
+	case rc == C.PCRE2_ERROR_JIT_STACKLIMIT:
+		return pregJITStackLimitError
+	default:
+		return pregInternalError
+	}
+}
 
 func compilePCRE2(pattern string) (*pcreCompiled, bool) {
 	if v, ok := pcreCache.Load(pattern); ok {
@@ -138,7 +169,7 @@ func compilePCRE2(pattern string) (*pcreCompiled, bool) {
 		groups:  capCount + 1,
 		names:   names,
 	}
-	actual, loaded := pcreCache.LoadOrStore(pattern, compiled)
+	actual, loaded := pcreCache.LoadOrStore(strings.Clone(pattern), compiled)
 	if loaded {
 		C.pcre2_code_free_8(code)
 		return actual.(*pcreCompiled), true
@@ -238,12 +269,13 @@ func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'
 }
 
-func (c *pcreCompiled) findOne(subject string, startOffset int) ([]int, bool) {
+// findOne rend la première correspondance (nil sans correspondance) et le code de preg_last_error() de l'appel.
+func (c *pcreCompiled) findOne(subject string, startOffset int) ([]int, int64) {
 	if c.utf8 && !utf8.ValidString(subject) {
-		return nil, false
+		return nil, pregBadUTF8Error
 	}
 	if startOffset < 0 || startOffset > len(subject) {
-		return nil, false
+		return nil, pregInternalError
 	}
 	var subPtr C.PCRE2_SPTR8
 	var rawSub []byte
@@ -253,26 +285,27 @@ func (c *pcreCompiled) findOne(subject string, startOffset int) ([]int, bool) {
 	}
 	md := C.pcre2_match_data_create_from_pattern_8(c.code, nil)
 	if md == nil {
-		return nil, false
+		return nil, pregInternalError
 	}
 	defer C.pcre2_match_data_free_8(md)
 
-	rc := C.pcre2_match_8(c.code, subPtr, C.PCRE2_SIZE(len(rawSub)), C.PCRE2_SIZE(startOffset), 0, md, nil)
+	rc := C.pcre2_match_8(c.code, subPtr, C.PCRE2_SIZE(len(rawSub)), C.PCRE2_SIZE(startOffset), 0, md, pcreMatchContext())
 	if rc == C.PCRE2_ERROR_NOMATCH {
-		return nil, true
+		return nil, pregNoError
 	}
 	if rc < 0 {
-		return nil, false
+		return nil, pcreErrorCode(rc)
 	}
-	return c.extractLocs(md, int(rc)), true
+	return c.extractLocs(md, int(rc)), pregNoError
 }
 
-func (c *pcreCompiled) findAll(subject string, startOffset int) ([][]int, bool) {
+// findAll rend toutes les correspondances et le code de preg_last_error() de l'appel.
+func (c *pcreCompiled) findAll(subject string, startOffset int) ([][]int, int64) {
 	if c.utf8 && !utf8.ValidString(subject) {
-		return nil, false
+		return nil, pregBadUTF8Error
 	}
 	if startOffset < 0 || startOffset > len(subject) {
-		return nil, false
+		return nil, pregInternalError
 	}
 	var subPtr C.PCRE2_SPTR8
 	var rawSub []byte
@@ -282,7 +315,7 @@ func (c *pcreCompiled) findAll(subject string, startOffset int) ([][]int, bool) 
 	}
 	md := C.pcre2_match_data_create_from_pattern_8(c.code, nil)
 	if md == nil {
-		return nil, false
+		return nil, pregInternalError
 	}
 	defer C.pcre2_match_data_free_8(md)
 
@@ -290,7 +323,7 @@ func (c *pcreCompiled) findAll(subject string, startOffset int) ([][]int, bool) 
 	offset := startOffset
 	var extraOpts C.uint32_t
 	for {
-		rc := C.pcre2_match_8(c.code, subPtr, C.PCRE2_SIZE(len(rawSub)), C.PCRE2_SIZE(offset), extraOpts, md, nil)
+		rc := C.pcre2_match_8(c.code, subPtr, C.PCRE2_SIZE(len(rawSub)), C.PCRE2_SIZE(offset), extraOpts, md, pcreMatchContext())
 		if rc == C.PCRE2_ERROR_NOMATCH {
 			if extraOpts != 0 && offset < len(rawSub) {
 				if c.utf8 {
@@ -308,7 +341,7 @@ func (c *pcreCompiled) findAll(subject string, startOffset int) ([][]int, bool) 
 			break
 		}
 		if rc < 0 {
-			return nil, false
+			return nil, pcreErrorCode(rc)
 		}
 		locs := c.extractLocs(md, int(rc))
 		all = append(all, locs)
@@ -326,7 +359,7 @@ func (c *pcreCompiled) findAll(subject string, startOffset int) ([][]int, bool) 
 			offset = locs[1]
 		}
 	}
-	return all, true
+	return all, pregNoError
 }
 
 func (c *pcreCompiled) extractLocs(md *C.pcre2_match_data_8, rc int) []int {
@@ -365,10 +398,12 @@ func resolveMatchOffset(subject string, offset int64) (int, bool) {
 func workerMatch(z *zone.Zone, op, pattern, subject string, flags, offset int64, ref types.Value) (types.Value, error) {
 	compiled, ok := compilePCRE2(pattern)
 	if !ok {
+		setPregError(z, pregInternalError)
 		return types.NewBool(false), nil
 	}
 	startOffset, ok := resolveMatchOffset(subject, offset)
 	if !ok {
+		setPregError(z, pregInternalError)
 		empty, err := newArray(z)
 		if err != nil {
 			return types.Value{}, err
@@ -379,8 +414,9 @@ func workerMatch(z *zone.Zone, op, pattern, subject string, flags, offset int64,
 	offCap := flags&flagOffsetCapture != 0
 	nullUn := flags&flagUnmatchedAsNull != 0
 	if op == "match" {
-		locs, valid := compiled.findOne(subject, startOffset)
-		if !valid {
+		locs, code := compiled.findOne(subject, startOffset)
+		setPregError(z, code)
+		if code != pregNoError {
 			empty, err := newArray(z)
 			if err != nil {
 				return types.Value{}, err
@@ -403,8 +439,9 @@ func workerMatch(z *zone.Zone, op, pattern, subject string, flags, offset int64,
 		writeRef(z, ref, set)
 		return types.NewLong(1), nil
 	}
-	all, valid := compiled.findAll(subject, startOffset)
-	if !valid {
+	all, code := compiled.findAll(subject, startOffset)
+	setPregError(z, code)
+	if code != pregNoError {
 		empty, err := newArray(z)
 		if err != nil {
 			return types.Value{}, err
@@ -523,13 +560,15 @@ func workerReplace(z *zone.Zone, pattern, repl, subject string, limit int64, cou
 func pcreReplaceSingle(z *zone.Zone, pattern, repl, subject string, limit int64) (string, int64, bool, error) {
 	compiled, ok := compilePCRE2(pattern)
 	if !ok {
+		setPregError(z, pregInternalError)
 		return "", 0, false, nil
 	}
 	if limit == 0 {
 		return subject, 0, true, nil
 	}
-	all, valid := compiled.findAll(subject, 0)
-	if !valid {
+	all, code := compiled.findAll(subject, 0)
+	setPregError(z, code)
+	if code != pregNoError {
 		return "", 0, false, nil
 	}
 	if limit > 0 && int64(len(all)) > limit {
@@ -623,10 +662,12 @@ func expandPCRE2Repl(repl, subject string, locs []int) string {
 func workerSplit(z *zone.Zone, pattern, subject string, limit, flags int64) (types.Value, error) {
 	compiled, ok := compilePCRE2(pattern)
 	if !ok {
+		setPregError(z, pregInternalError)
 		return types.NewBool(false), nil
 	}
-	all, valid := compiled.findAll(subject, 0)
-	if !valid {
+	all, code := compiled.findAll(subject, 0)
+	setPregError(z, code)
+	if code != pregNoError {
 		return types.NewBool(false), nil
 	}
 	noEmpty := flags&flagSplitNoEmpty != 0
@@ -687,9 +728,11 @@ func workerSplit(z *zone.Zone, pattern, subject string, limit, flags int64) (typ
 	return out, nil
 }
 
+// workerGrep s'arrête, comme PHP 8.3, au premier élément dont l'exécution échoue et rend les éléments retenus jusque-là.
 func workerGrep(z *zone.Zone, pattern string, arr types.Value, flags int64) (types.Value, error) {
 	compiled, ok := compilePCRE2(pattern)
 	if !ok {
+		setPregError(z, pregInternalError)
 		return types.NewBool(false), nil
 	}
 	invert := flags&flagGrepInvert != 0
@@ -703,9 +746,10 @@ func workerGrep(z *zone.Zone, pattern string, arr types.Value, flags int64) (typ
 		if err != nil {
 			s = ""
 		}
-		locs, valid := compiled.findOne(s, 0)
-		if !valid {
-			return true
+		locs, code := compiled.findOne(s, 0)
+		setPregError(z, code)
+		if code != pregNoError {
+			return false
 		}
 		matched := locs != nil
 		if invert {
@@ -723,4 +767,26 @@ func workerGrep(z *zone.Zone, pattern string, arr types.Value, flags int64) (typ
 		return types.Value{}, walkErr
 	}
 	return out, nil
+}
+
+// PCREFindAll compile le motif PCRE2, relève jusqu'à limit correspondances dans subject (toutes si limit < 0, aucune si limit == 0) et consigne le code de preg_last_error() dans la Zone.
+func PCREFindAll(z *zone.Zone, pattern, subject string, limit int) ([][]int, []string, bool) {
+	compiled, ok := compilePCRE2(pattern)
+	if !ok {
+		setPregError(z, pregInternalError)
+		return nil, nil, false
+	}
+	if limit == 0 {
+		setPregError(z, pregNoError)
+		return nil, compiled.names, true
+	}
+	all, code := compiled.findAll(subject, 0)
+	setPregError(z, code)
+	if code != pregNoError {
+		return nil, nil, false
+	}
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+	return all, compiled.names, true
 }

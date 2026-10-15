@@ -4,18 +4,24 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"weak"
 
 	"code.hazyhaar.fr/devhoros/php127/bytecode"
 	"code.hazyhaar.fr/devhoros/php127/datetime"
+	"code.hazyhaar.fr/devhoros/php127/ext"
 	"code.hazyhaar.fr/devhoros/php127/fiber"
+	"code.hazyhaar.fr/devhoros/php127/mysqli"
 	"code.hazyhaar.fr/devhoros/php127/pdo"
 	"code.hazyhaar.fr/devhoros/php127/reflection"
 	"code.hazyhaar.fr/devhoros/php127/sapi"
 	"code.hazyhaar.fr/devhoros/php127/session"
 	"code.hazyhaar.fr/devhoros/php127/spl"
+	"code.hazyhaar.fr/devhoros/php127/stdlib"
 	"code.hazyhaar.fr/devhoros/php127/streams"
 	"code.hazyhaar.fr/devhoros/php127/types"
 	"code.hazyhaar.fr/devhoros/php127/zone"
@@ -28,6 +34,16 @@ type Context struct {
 	strs              map[*bytecode.OpArray][]types.Value
 	BlockTaintedSinks bool
 	TaintedSinks      int
+	// CLIArgv porte l'argv de la SAPI CLI (script tel que nommé, puis ses arguments) ; non nil, il fait
+	// construire $_SERVER comme le fait PHP en ligne de commande. CLIInline signale un code fourni par -r
+	// ou l'entrée standard.
+	CLIArgv   []string
+	CLIInline bool
+	// INIOverrides porte les directives de la ligne de commande (-d clé=valeur) : valeurs maîtresses de la
+	// requête, rendues par ini_get, rétablies par ini_restore et publiées en global_value par ini_get_all.
+	INIOverrides map[string]string
+	// ArchtimeImage porte l'image de bootstrap gelée dans la zone de processus (variables globales et constantes).
+	ArchtimeImage *ArchtimeImage
 }
 
 func NewContext() *Context { return &Context{} }
@@ -107,6 +123,10 @@ type frame struct {
 	hasPending    bool
 	dynamicLocals map[string]types.Value
 	args          []types.Value
+	// includeScope vaut l'indice plus un du cadre dont un include ou un eval partage la portée ; zéro désigne une portée propre.
+	includeScope int
+	// silence compte les régions @ ouvertes dans ce cadre ; un catch ou un finally du même cadre le remet à zéro, l'opérateur @ ne portant que sur une expression.
+	silence int
 }
 
 type namedArg struct {
@@ -133,10 +153,14 @@ type callSpec struct {
 	obj        types.Value
 	hasObj     bool
 	pooledArgs bool
-	args       []types.Value
-	named      []namedArg
-	flags      uint16
-	line       uint32
+	// refResolved, refParams et refNative mémorisent la signature de l'appelé lue par funcArgByRef.
+	refResolved bool
+	refParams   []bytecode.ParamInfo
+	refNative   string
+	args        []types.Value
+	named       []namedArg
+	flags       uint16
+	line        uint32
 }
 
 type closureData struct {
@@ -176,16 +200,18 @@ type VM struct {
 	hasThrow bool
 	excTrace []traceItem
 
-	closures          []closureData
-	generators        []*generator
-	enums             map[uint32][]types.Value
-	statics           map[uint32][]types.Value
-	localStatics      map[*bytecode.OpArray]map[uint32]types.Value
-	globals           map[string]types.Value
-	constCache        map[string]types.Value
-	errorReporting    int64
-	included          map[string]bool
-	progCloned        bool
+	closures       []closureData
+	generators     []*generator
+	enums          map[uint32][]types.Value
+	statics        map[uint32][]types.Value
+	localStatics   map[*bytecode.OpArray]map[uint32]types.Value
+	globals        map[string]types.Value
+	constCache     map[string]types.Value
+	errorReporting int64
+	included       map[string]bool
+	progCloned     bool
+	// origProgram retient le programme partagé remplacé par sa copie à la première fusion dynamique ; finishRequest le restaure.
+	origProgram       *bytecode.Program
 	superglobalsInit  bool
 	lastProg          *bytecode.Program
 	propCaches        [][]bytecode.PropIC
@@ -200,6 +226,50 @@ type VM struct {
 	exceptionHandlers []types.Value
 	autoloaders       []types.Value
 	arrayCursors      map[uint32]int
+
+	// État de liaison dynamique des classes, propre à une requête et remis à zéro par finishRequest.
+	classState     map[uint32]bool
+	classIndex     map[uint32]*bytecode.ClassProto
+	classNames     map[string]uint32
+	classAliases   map[string]uint32
+	ownedClasses   map[*bytecode.ClassProto]bool
+	pendingClasses []pendingClass
+	declOrder      []declEntry
+	userConsts     []string
+	autoloading    map[string]bool
+	ifaceTried     map[string]bool
+	mainDecl       *fileDecls
+	mainDeclDone   bool
+	funcSites      map[string]declSite
+	funcNames      map[string]int
+	nextClassID    uint32
+	nextFuncID     uint32
+	shutdownFuncs  []shutdownCall
+	ini            map[string]string
+	// mainReturned signale que le programme principal a atteint son retour, distinct d'un exit ou d'une erreur fatale.
+	mainReturned bool
+	// gcDisabled reflète gc_disable() pour gc_enabled() pendant la requête.
+	gcDisabled bool
+}
+
+// pendingClass décrit une classe compilée dont le parent ou un trait n'est pas encore déclaré.
+type pendingClass struct {
+	id       uint32
+	topLevel bool
+	file     string
+	line     uint32
+}
+
+// declEntry note une déclaration de classe liée dynamiquement ou un alias, dans l'ordre de get_declared_classes.
+type declEntry struct {
+	id    uint32
+	alias string
+}
+
+// shutdownCall retient un rappel de register_shutdown_function et ses arguments.
+type shutdownCall struct {
+	cb   types.Value
+	args []types.Value
 }
 
 type magicKey struct {
@@ -282,7 +352,14 @@ func (vm *VM) ensureCallCache(fn *bytecode.OpArray) []bytecode.CallIC {
 	return c
 }
 
+// zoneVM associe une zone à la VM qui l'exécute, le temps d'une requête seulement : le crochet de destructeur y
+// retrouve la VM. L'entrée est retirée à la sortie d'Execute, aucune zone n'y reste attachée entre deux requêtes.
 var zoneVM sync.Map
+
+// idleVM garde au repos la VM réservée à une zone entre deux requêtes, sous une clé faible : la VM au repos ne
+// référence plus sa zone, l'entrée ne retient donc pas la zone, et un nettoyage d'exécution la retire lorsque la
+// zone est collectée.
+var idleVM sync.Map
 
 func init() {
 	types.SetObjectDestructor(func(z *zone.Zone, v types.Value) {
@@ -316,44 +393,56 @@ func New(z *zone.Zone, stdout, stderr io.Writer, prog *bytecode.Program, ctx *Co
 }
 
 func Execute(z *zone.Zone, stdout, stderr io.Writer, prog *bytecode.Program, ctx *Context) int {
-	if z != nil {
-		if raw, ok := zoneVM.Load(z); ok {
-			vm := raw.(*VM)
-			if vm.inUse.CompareAndSwap(false, true) {
-				if stdout == nil {
-					stdout = io.Discard
-				}
-				if stderr == nil {
-					stderr = io.Discard
-				}
-				vm.Out = stdout
-				vm.Err = stderr
-				vm.Program = prog
-				if ctx == nil {
-					vm.Context = &vm.defaultCtx
-				} else {
-					vm.Context = ctx
-				}
-				vm.exit = 0
-				vm.stop = false
-				vm.control = false
-				vm.errorReporting = 32767
-				vm.progCloned = false
-				vm.superglobalsInit = false
-				vm.sessionActive = false
-				return vm.executePooled()
-			}
+	if z == nil {
+		return New(z, stdout, stderr, prog, ctx).Execute()
+	}
+	key := weak.Make(z)
+	if raw, ok := idleVM.Load(key); ok {
+		vm := raw.(*VM)
+		if !vm.inUse.CompareAndSwap(false, true) {
+			return New(z, stdout, stderr, prog, ctx).Execute()
 		}
-		vm := New(z, stdout, stderr, prog, ctx)
-		vm.pooled = true
-		vm.inUse.Store(true)
-		zoneVM.Store(z, vm)
+		if stdout == nil {
+			stdout = io.Discard
+		}
+		if stderr == nil {
+			stderr = io.Discard
+		}
+		vm.Zone = z
+		vm.Out = stdout
+		vm.Err = stderr
+		vm.Program = prog
+		if ctx == nil {
+			vm.Context = &vm.defaultCtx
+		} else {
+			vm.Context = ctx
+		}
+		vm.exit = 0
+		vm.stop = false
+		vm.control = false
+		vm.errorReporting = 32767
+		vm.progCloned = false
+		vm.superglobalsInit = false
+		vm.sessionActive = false
+		vm.dropDynamicState()
 		return vm.executePooled()
 	}
-	return New(z, stdout, stderr, prog, ctx).Execute()
+	vm := New(z, stdout, stderr, prog, ctx)
+	vm.pooled = true
+	vm.inUse.Store(true)
+	if _, loaded := idleVM.LoadOrStore(key, vm); loaded {
+		// Une autre requête a réservé une VM à cette zone entre-temps : celle-ci s'exécute hors réserve.
+		vm.pooled = false
+		vm.inUse.Store(false)
+		return vm.Execute()
+	}
+	runtime.AddCleanup(z, func(k weak.Pointer[zone.Zone]) { idleVM.Delete(k) }, key)
+	return vm.executePooled()
 }
 
 func (vm *VM) executePooled() (res int) {
+	z := vm.Zone
+	zoneVM.Store(z, vm)
 	defer func() {
 		if r := recover(); r != nil {
 			if vm.Out != nil {
@@ -361,8 +450,15 @@ func (vm *VM) executePooled() (res int) {
 			}
 			vm.stop = true
 			vm.exit = 255
+			vm.finishAfterPanic()
 			res = 255
 		}
+		zoneVM.CompareAndDelete(z, vm)
+		// La VM au repos lâche sa zone et ses flux de sortie : la réserve idleVM ne les retient pas.
+		vm.Zone = nil
+		vm.Out = nil
+		vm.Err = nil
+		vm.Context = nil
 		vm.inUse.Store(false)
 	}()
 	if vm.Program == nil || vm.Program.Main == nil {
@@ -380,14 +476,17 @@ func (vm *VM) executePooled() (res int) {
 			vm.lastErr = vm.Err
 		}
 	}
+	vm.applyINIOverrides()
+	vm.applyArchtimeImage()
 	if vm.Program.NeedsSuperglobals || !vm.Program.Main.CVMetaResolved {
 		vm.initSuperglobals()
 		vm.superglobalsInit = true
 	}
-	vm.invokeOpArray(vm.Program.Main, types.Value{}, false, nil, 0, 0, 0)
+	vm.runMain()
 	if !vm.stop {
 		vm.exit = 0
 	}
+	vm.runShutdownFunctions()
 	vm.finishRequest()
 	res = vm.exit
 	return res
@@ -401,6 +500,7 @@ func (vm *VM) Execute() (res int) {
 			}
 			vm.stop = true
 			vm.exit = 255
+			vm.finishAfterPanic()
 			res = 255
 		}
 	}()
@@ -431,16 +531,58 @@ func (vm *VM) Execute() (res int) {
 			}
 		}()
 	}
+	vm.applyINIOverrides()
+	vm.applyArchtimeImage()
 	if vm.Program.NeedsSuperglobals || !vm.Program.Main.CVMetaResolved {
 		vm.initSuperglobals()
 		vm.superglobalsInit = true
 	}
-	vm.invokeOpArray(vm.Program.Main, types.Value{}, false, nil, 0, 0, 0)
+	vm.runMain()
 	if !vm.stop {
 		vm.exit = 0
 	}
+	vm.runShutdownFunctions()
 	vm.finishRequest()
 	return vm.exit
+}
+
+// runMain exécute le programme principal : contrôle préalable des classes qu'il déclare, $argv et $argc de la
+// SAPI CLI posés dans sa portée, puis, à son retour, liaison ou erreur des classes restées en attente.
+func (vm *VM) runMain() {
+	main := vm.Program.Main
+	vm.mainReturned = false
+	if !vm.checkMainClasses() {
+		return
+	}
+	if vm.Context != nil && (vm.Context.CLIArgv != nil || vm.Context.ArchtimeImage != nil) {
+		// Le programme principal ne reçoit aucun argument : le cadre général suffit et laisse poser $argv, $argc et l'image ARCHTIME avant la première instruction.
+		if !vm.pushFrame(main, 0, 0, types.Value{}, false, 0) {
+			return
+		}
+		vm.seedRootGlobals()
+		vm.seedCLIGlobals()
+		vm.execFrames(len(vm.frames) - 1)
+		v, _ := vm.takeReturn()
+		vmRelease(vm.Zone, &v)
+	} else {
+		v, _ := vm.invokeOpArray(main, types.Value{}, false, nil, 0, 0, 0)
+		vmRelease(vm.Zone, &v)
+	}
+	vm.settleMainPending()
+}
+
+// finishAfterPanic rejoue, après une panique récupérée, les rappels d'arrêt puis la fin de requête qui libère les ressources de la zone ; une seconde panique dans l'une ou l'autre étape est absorbée pour que la suivante s'exécute.
+func (vm *VM) finishAfterPanic() {
+	exit := vm.exit
+	func() {
+		defer func() { _ = recover() }()
+		vm.runShutdownFunctions()
+	}()
+	func() {
+		defer func() { _ = recover() }()
+		vm.finishRequest()
+	}()
+	vm.exit = exit
 }
 
 func (vm *VM) runZoneCleanups() {
@@ -452,19 +594,23 @@ func (vm *VM) runZoneCleanups() {
 		session.DispatchCleanup(vm.Zone, item)
 		streams.DispatchCleanup(item)
 		pdo.DispatchCleanup(item)
+		if item.Kind == mysqli.CleanupKind {
+			mysqli.DispatchZoneCleanup(vm.Zone, item)
+		}
+		stdlib.DispatchCleanup(vm.Zone, item)
+		ext.DispatchCleanup(vm.Zone, item)
 		types.DispatchObjectDestructor(vm.Zone, item)
 	})
 }
 
 func (vm *VM) finishRequest() {
 	if vm.Zone == nil {
+		vm.dropDynamicState()
+		vm.restoreProgram()
 		return
 	}
 	vm.stop = false
 	vm.control = false
-	if vm.progCloned {
-		vm.lastProg = nil
-	}
 	vm.syncSessionBeforeClose()
 	if len(vm.fiberCallbacks) > 0 || len(vm.fiberSuspended) > 0 || len(vm.fiberCallerStack) > 0 {
 		for f, obj := range vm.fiberCallbacks {
@@ -611,6 +757,144 @@ func (vm *VM) finishRequest() {
 		vmRelease(vm.Zone, &vm.autoloaders[i])
 	}
 	vm.autoloaders = nil
+	for i := range vm.shutdownFuncs {
+		vmRelease(vm.Zone, &vm.shutdownFuncs[i].cb)
+		vm.releaseArgs(vm.shutdownFuncs[i].args)
+	}
+	stdlib.ResetSysState(vm.Zone)
+	vm.dropDynamicState()
+	vm.restoreProgram()
+}
+
+// restoreProgram remet en place le programme partagé d'origine : la copie construite par cloneProgram porte les classes et fonctions des fichiers inclus et ne doit pas survivre à la requête.
+func (vm *VM) restoreProgram() {
+	if !vm.progCloned {
+		return
+	}
+	if vm.origProgram != nil {
+		vm.Program = vm.origProgram
+	}
+	vm.origProgram = nil
+	vm.progCloned = false
+	vm.lastProg = nil
+}
+
+// forwardThis transmet $this à un appel parent::, self::, static:: ou Classe:: émis depuis une méthode d'instance dont l'objet appartient à la classe visée, comme PHP pour une méthode non statique.
+func (vm *VM) forwardThis(in *bytecode.Instr) {
+	if in.Flags&bytecode.FlagUseThis != 0 || len(vm.frames) == 0 {
+		return
+	}
+	fr := vm.frame()
+	if !fr.hasThis {
+		return
+	}
+	target := in.Op2
+	switch {
+	case in.Flags&bytecode.FlagParent != 0:
+		target = vm.parentOf(fr.scopeClass)
+	case in.Flags&bytecode.FlagSelf != 0:
+		target = fr.scopeClass
+	case in.Flags&bytecode.FlagStatic != 0:
+		target = fr.calledClass
+	}
+	this := types.Deref(vm.Zone, fr.this)
+	if this.Type != types.TypeObject || target == bytecode.ClassNone {
+		return
+	}
+	if !vm.isInstance(types.ObjectInfo(vm.Zone, this).ClassID, target) {
+		return
+	}
+	if int(in.Op1) < len(fr.fn.Strings) {
+		if raw := fr.fn.Strings[in.Op1]; !strings.HasPrefix(raw, "\x00") {
+			if m, _, ok := vm.findMethod(target, raw); ok && m.Static {
+				return
+			}
+		}
+	}
+	in.Flags |= bytecode.FlagUseThis
+}
+
+// dropDynamicState oublie l'état de liaison dynamique sans libérer de valeur de zone ; finishRequest libère au préalable les valeurs retenues.
+func (vm *VM) dropDynamicState() {
+	vm.classState = nil
+	vm.classIndex = nil
+	vm.classNames = nil
+	vm.classAliases = nil
+	vm.ownedClasses = nil
+	vm.pendingClasses = nil
+	vm.declOrder = nil
+	vm.userConsts = nil
+	vm.autoloading = nil
+	vm.ifaceTried = nil
+	vm.mainDecl = nil
+	vm.mainDeclDone = false
+	vm.funcSites = nil
+	vm.funcNames = nil
+	vm.nextClassID = 0
+	vm.nextFuncID = 0
+	vm.shutdownFuncs = nil
+	vm.ini = nil
+	vm.gcDisabled = false
+}
+
+// runShutdownFunctions exécute en ordre FIFO les rappels de register_shutdown_function, y compris après exit ou une erreur fatale ; un exit dans un rappel interrompt la suite.
+func (vm *VM) runShutdownFunctions() {
+	if len(vm.shutdownFuncs) == 0 || vm.Zone == nil {
+		return
+	}
+	exit := vm.exit
+	vm.stop = false
+	vm.control = false
+	for len(vm.frames) > 1 {
+		vm.releaseFrameValues()
+		if len(vm.frames) > 1 {
+			fr := vm.frames[len(vm.frames)-1]
+			clear(vm.slots[fr.cvBase : fr.cvBase+fr.span])
+			vm.popFrame()
+		}
+	}
+	if len(vm.frames) == 0 {
+		// Le cadre racine a été dépilé par une exception non rattrapée : un cadre neutre tient lieu de portée principale pour les rappels.
+		root := &bytecode.OpArray{Name: "{main}", Code: []bytecode.Instr{{Op: bytecode.OpReturn, Flags: bytecode.FlagReturnVoid}}, Aux: []uint32{bytecode.NoCV}, CVMetaResolved: true}
+		if vm.Program != nil && vm.Program.Main != nil {
+			root.Filename = vm.Program.Main.Filename
+		}
+		if !vm.pushFrame(root, 0, 0, types.Value{}, false, 0) {
+			return
+		}
+	}
+	for _, sp := range vm.pending {
+		vm.releaseArgs(sp.args)
+		vm.releaseSpecObj(sp)
+	}
+	vm.pending = vm.pending[:0]
+	if vm.hasThrow {
+		vmRelease(vm.Zone, &vm.thrown)
+		vm.hasThrow = false
+	}
+	for i := 0; i < len(vm.shutdownFuncs); i++ {
+		entry := vm.shutdownFuncs[i]
+		vm.shutdownFuncs[i] = shutdownCall{}
+		call, ok := vm.callback(entry.cb)
+		if !ok {
+			vmRelease(vm.Zone, &entry.cb)
+			vm.releaseArgs(entry.args)
+			continue
+		}
+		ret, threw := vm.invokeCallback(call, entry.args, 0)
+		vmRelease(vm.Zone, &ret)
+		vmRelease(vm.Zone, &entry.cb)
+		if vm.stop || threw {
+			for _, rest := range vm.shutdownFuncs[i+1:] {
+				vmRelease(vm.Zone, &rest.cb)
+				vm.releaseArgs(rest.args)
+			}
+			vm.shutdownFuncs = nil
+			return
+		}
+	}
+	vm.shutdownFuncs = nil
+	vm.exit = exit
 }
 
 func (vm *VM) frame() *frame {
@@ -1234,7 +1518,21 @@ func (vm *VM) execFrames(base int) {
 			*slot = types.RetainReference(vm.Zone, ref)
 			vmRelease(vm.Zone, &oldSlot)
 			vm.bump()
-		case bytecode.OpNop, bytecode.OpEnterFinally:
+		case bytecode.OpNop:
+			if in.Flags&bytecode.FlagDeclareClass != 0 {
+				vm.opDeclareClass(in.Op1)
+				break
+			}
+			if in.Flags&bytecode.FlagSilenceBegin != 0 {
+				vm.frame().silence++
+			} else if in.Flags&bytecode.FlagSilenceEnd != 0 {
+				if fr := vm.frame(); fr.silence > 0 {
+					fr.silence--
+				}
+			}
+			vm.bump()
+		case bytecode.OpEnterFinally:
+			vm.frame().silence = 0
 			vm.bump()
 		case bytecode.OpDup:
 			v := vm.pop()
@@ -1340,7 +1638,7 @@ func (vm *VM) execFrames(base int) {
 		case bytecode.OpAppendArrayElement:
 			vm.opAddElem(false, in)
 		case bytecode.OpFetchDimR, bytecode.OpFetchDimW, bytecode.OpFetchDimIs:
-			vm.opFetchDim(op)
+			vm.opFetchDim(op, in.Flags)
 		case bytecode.OpAssignDim, bytecode.OpAssignDimOp:
 			vm.opAssignDim(op, in)
 		case bytecode.OpUnsetDim:
@@ -1349,10 +1647,53 @@ func (vm *VM) execFrames(base int) {
 			vm.opIssetDim(op == bytecode.OpEmptyDim)
 		case bytecode.OpFeResetR, bytecode.OpFeResetRW, bytecode.OpFeFetchR, bytecode.OpFeFetchRW, bytecode.OpFeFree:
 			vm.opForeach(op, in)
-		case bytecode.OpInitCall, bytecode.OpInitMethodCall, bytecode.OpInitStaticMethodCall, bytecode.OpInitNew:
+		case bytecode.OpInitCall, bytecode.OpInitMethodCall:
+			vm.opInit(op, in)
+		case bytecode.OpInitNew:
+			if in.Flags&bytecode.FlagDynamicClass != 0 {
+				id, msg := vm.dynamicClassOperand(in.Op1, false)
+				if id == 0 {
+					if msg != "" {
+						vm.raiseBuiltin(bytecode.ClassError, msg, 0)
+					}
+					break
+				}
+				in.Op1, in.Flags = id, in.Flags&^bytecode.FlagDynamicClass
+			} else if in.Flags&(bytecode.FlagSelf|bytecode.FlagParent|bytecode.FlagStatic) == 0 && in.Op1 >= bytecode.ClassUser {
+				id, ok := vm.classOperand(in.Op1)
+				if !ok {
+					if !vm.stop && !vm.control {
+						vm.raiseClassNotFound(in.Op1)
+					}
+					break
+				}
+				in.Op1 = id
+			}
+			vm.opInit(op, in)
+		case bytecode.OpInitStaticMethodCall:
+			if in.Flags&bytecode.FlagDynamicClass != 0 {
+				id, msg := vm.dynamicClassOperand(in.Op2, false)
+				if id == 0 {
+					if msg != "" {
+						vm.raiseBuiltin(bytecode.ClassError, msg, 0)
+					}
+					break
+				}
+				in.Op2, in.Flags = id, in.Flags&^bytecode.FlagDynamicClass
+			} else if in.Flags&(bytecode.FlagSelf|bytecode.FlagParent|bytecode.FlagStatic) == 0 && in.Op2 >= bytecode.ClassUser {
+				id, ok := vm.classOperand(in.Op2)
+				if !ok {
+					if !vm.stop && !vm.control {
+						vm.raiseClassNotFound(in.Op2)
+					}
+					break
+				}
+				in.Op2 = id
+			}
+			vm.forwardThis(&in)
 			vm.opInit(op, in)
 		case bytecode.OpSendVal, bytecode.OpSendRef:
-			vm.opSend(op == bytecode.OpSendRef)
+			vm.opSend(op == bytecode.OpSendRef || in.Flags&bytecode.FlagFuncArg != 0 && vm.funcArgByRef())
 		case bytecode.OpSendNamed:
 			vm.opSendNamed(in.Op1)
 		case bytecode.OpSendUnpack:
@@ -1367,14 +1708,71 @@ func (vm *VM) execFrames(base int) {
 			vm.opAssignProp(op, in)
 		case bytecode.OpUnsetProp, bytecode.OpIssetProp, bytecode.OpEmptyProp:
 			vm.opPropQuery(op, in.Op1)
-		case bytecode.OpFetchStaticPropR:
-			vm.opStaticProp(false, in)
-		case bytecode.OpAssignStaticProp:
-			vm.opStaticProp(true, in)
-		case bytecode.OpFetchClassConst:
-			vm.opClassConst(in)
+		case bytecode.OpFetchStaticPropR, bytecode.OpAssignStaticProp, bytecode.OpFetchClassConst:
+			if in.Flags&bytecode.FlagDynamicClass != 0 {
+				if op == bytecode.OpFetchClassConst && vm.frame().fn.Strings[in.Op1] == "class" {
+					vm.dynamicClassName(in.Op2)
+					break
+				}
+				id, msg := vm.dynamicClassOperand(in.Op2, false)
+				if id == 0 {
+					if msg != "" {
+						if op == bytecode.OpAssignStaticProp {
+							v := vm.pop()
+							vmRelease(vm.Zone, &v)
+						}
+						vm.raiseBuiltin(bytecode.ClassError, msg, 0)
+					}
+					break
+				}
+				in.Op2, in.Flags = id, in.Flags&^bytecode.FlagDynamicClass
+			} else if in.Flags&(bytecode.FlagSelf|bytecode.FlagParent|bytecode.FlagStatic) == 0 && in.Op2 >= bytecode.ClassUser {
+				id, ok := vm.classOperand(in.Op2)
+				if !ok {
+					if !vm.stop && !vm.control {
+						if op == bytecode.OpAssignStaticProp {
+							v := vm.pop()
+							vmRelease(vm.Zone, &v)
+						}
+						vm.raiseClassNotFound(in.Op2)
+					}
+					break
+				}
+				in.Op2 = id
+			}
+			switch op {
+			case bytecode.OpFetchStaticPropR:
+				vm.opStaticProp(false, in)
+			case bytecode.OpAssignStaticProp:
+				vm.opStaticProp(true, in)
+			default:
+				vm.opClassConst(in)
+			}
 		case bytecode.OpInstanceof:
-			vm.opInstanceof(in.Op1)
+			switch {
+			case in.Flags&bytecode.FlagDynamicClass != 0:
+				id, msg := vm.dynamicClassOperand(in.Op1, true)
+				if id != 0 {
+					vm.opInstanceof(id)
+					break
+				}
+				v := vm.pop()
+				vmRelease(vm.Zone, &v)
+				if msg != "" {
+					vm.raiseBuiltin(bytecode.ClassError, msg, 0)
+					break
+				}
+				vm.push(types.NewBool(false))
+				vm.bump()
+			case in.Flags&bytecode.FlagSelf != 0:
+				vm.opInstanceof(vm.frame().scopeClass)
+			case in.Flags&bytecode.FlagParent != 0:
+				vm.opInstanceof(vm.parentOf(vm.frame().scopeClass))
+			case in.Flags&bytecode.FlagStatic != 0:
+				vm.opInstanceof(vm.frame().calledClass)
+			default:
+				vm.opInstanceof(in.Op1)
+			}
 		case bytecode.OpClone:
 			vm.opClone()
 		case bytecode.OpThrow:
@@ -1382,6 +1780,7 @@ func (vm *VM) execFrames(base int) {
 			vm.excTrace = nil
 			vm.throwAt(vm.frame().pc, v)
 		case bytecode.OpEnterCatch:
+			vm.frame().silence = 0
 			vm.opEnterCatch(in.Op1)
 		case bytecode.OpLeaveFinally, bytecode.OpFastRetFinally:
 			vm.finishFinally()

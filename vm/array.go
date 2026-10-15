@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -31,10 +30,7 @@ func (vm *VM) typeNameForDiag(v types.Value) string {
 }
 
 func (vm *VM) deprecatedFloatKey(w types.ArrayWarning) error {
-	if vm.errorReporting&8192 != 0 && vm.Out != nil {
-		file, line := vm.currentLoc()
-		_, _ = fmt.Fprintf(vm.Out, "\nDeprecated: Implicit conversion from float %s to int loses precision in %s on line %d\n", strconv.FormatFloat(w.Float, 'g', -1, 64), file, line)
-	}
+	vm.raiseDiag(eDeprecated, diagDeprecate, "Implicit conversion from float "+strconv.FormatFloat(w.Float, 'g', -1, 64)+" to int loses precision", vm.line)
 	return nil
 }
 
@@ -136,6 +132,10 @@ func (vm *VM) opAddElem(keyed bool, in bytecode.Instr) {
 		vm.bump()
 		return
 	}
+	if in.Flags&bytecode.FlagUnpack != 0 {
+		vm.opUnpackIntoArray()
+		return
+	}
 	val := vm.pop()
 	var key types.Value
 	if keyed {
@@ -218,7 +218,10 @@ func (vm *VM) opAddElem(keyed bool, in bytecode.Instr) {
 	vm.bump()
 }
 
-func (vm *VM) opFetchDim(op bytecode.Opcode) {
+func (vm *VM) opFetchDim(op bytecode.Opcode, flags uint16) {
+	if flags&bytecode.FlagFuncArg != 0 && vm.funcArgByRef() {
+		op = bytecode.OpFetchDimW
+	}
 	key := vm.pop()
 	arr := vm.pop()
 	if vm.stop {
@@ -235,6 +238,11 @@ func (vm *VM) opFetchDim(op bytecode.Opcode) {
 			return
 		}
 		if !ok || val.IsUndef() {
+			if flags&bytecode.FlagDimWrite == 0 && vm.warnUndefinedKey(key) {
+				vmRelease(vm.Zone, &key)
+				vmRelease(vm.Zone, &arr)
+				return
+			}
 			vm.push(types.NewNull())
 		} else {
 			vm.push(vmRetain(vm.Zone, types.Deref(vm.Zone, val)))
@@ -317,9 +325,10 @@ func (vm *VM) opFetchDim(op bytecode.Opcode) {
 			return
 		}
 		if op == bytecode.OpFetchDimR && (kd.Type == types.TypeDouble || kd.Type == types.TypeTrue || kd.Type == types.TypeFalse || kd.Type == types.TypeNull) {
-			if vm.errorReporting&2 != 0 && vm.Out != nil {
-				file, line := vm.currentLoc()
-				_, _ = fmt.Fprintf(vm.Out, "\nWarning: String offset cast occurred in %s on line %d\n", file, line)
+			if vm.emitWarning("String offset cast occurred", vm.line); vm.stop || vm.control {
+				vmRelease(vm.Zone, &key)
+				vmRelease(vm.Zone, &arr)
+				return
 			}
 		}
 		idx := vm.toLong(kd)
@@ -329,11 +338,8 @@ func (vm *VM) opFetchDim(op bytecode.Opcode) {
 			return
 		}
 		ch, err := types.ByteAt(vm.Zone, d, idx, func(w types.StringWarning) error {
-			if vm.errorReporting&2 != 0 && vm.Out != nil {
-				file, line := vm.currentLoc()
-				var buf [96]byte
-				_, _ = fmt.Fprintf(vm.Out, "\nWarning: %s in %s on line %d\n", w.AppendMessage(buf[:0]), file, line)
-			}
+			var buf [96]byte
+			vm.emitWarning(string(w.AppendMessage(buf[:0])), vm.line)
 			return nil
 		})
 		vmRelease(vm.Zone, &arr)
@@ -404,9 +410,14 @@ func (vm *VM) opFetchDim(op bytecode.Opcode) {
 		return
 	}
 	if d.Type != types.TypeArray {
-		if vm.errorReporting&2 != 0 && vm.Out != nil {
-			file, line := vm.currentLoc()
-			_, _ = fmt.Fprintf(vm.Out, "\nWarning: Trying to access array offset on %s in %s on line %d\n", scalarOffsetTypeName(d.Type), file, line)
+		autoVivified := flags&bytecode.FlagDimWrite != 0 && (d.Type == types.TypeNull || d.Type == types.TypeUndef || d.Type == types.TypeFalse)
+		if !autoVivified {
+			vm.emitWarning("Trying to access array offset on "+scalarOffsetTypeName(d.Type), vm.line)
+			if vm.stop || vm.control {
+				vmRelease(vm.Zone, &key)
+				vmRelease(vm.Zone, &arr)
+				return
+			}
 		}
 		vmRelease(vm.Zone, &key)
 		vmRelease(vm.Zone, &arr)
@@ -422,6 +433,11 @@ func (vm *VM) opFetchDim(op bytecode.Opcode) {
 		return
 	}
 	if !ok || val.IsUndef() {
+		if flags&bytecode.FlagDimWrite == 0 && vm.warnUndefinedKey(key) {
+			vmRelease(vm.Zone, &key)
+			vmRelease(vm.Zone, &arr)
+			return
+		}
 		vm.push(types.NewNull())
 	} else {
 		vm.push(vmRetain(vm.Zone, types.Deref(vm.Zone, val)))
@@ -429,6 +445,22 @@ func (vm *VM) opFetchDim(op bytecode.Opcode) {
 	vmRelease(vm.Zone, &key)
 	vmRelease(vm.Zone, &arr)
 	vm.bump()
+}
+
+// warnUndefinedKey signale par raiseDiag la lecture d'une clé absente, sous la forme normalisée de PHP :
+// entier nu, chaîne entre guillemets. Le résultat vrai signale que le gestionnaire a interrompu l'instruction.
+func (vm *VM) warnUndefinedKey(key types.Value) bool {
+	nk, err := types.NormalizeArrayKey(vm.Zone, key, nil)
+	if err != nil {
+		return false
+	}
+	msg := "Undefined array key "
+	if nk.Type == types.TypeLong {
+		msg += strconv.FormatInt(nk.ToLong(), 10)
+	} else {
+		msg += `"` + types.StringData(vm.Zone, nk) + `"`
+	}
+	return vm.raiseDiag(eWarning, diagWarning, msg, vm.line)
 }
 
 func (vm *VM) opAssignDim(op bytecode.Opcode, in bytecode.Instr) {
@@ -718,6 +750,13 @@ func (vm *VM) opAssignDim(op bytecode.Opcode, in bytecode.Instr) {
 }
 
 func (vm *VM) applyOp(op bytecode.Opcode, cur, val types.Value) types.Value {
+	if res, handled := vm.arrayOperands(op, cur, val); handled {
+		vmRelease(vm.Zone, &val)
+		if vm.stop || vm.control {
+			return types.NewNull()
+		}
+		return res
+	}
 	switch op {
 	case bytecode.OpAdd:
 		res := types.Add(vm.num(cur), vm.num(val))
@@ -1176,3 +1215,55 @@ func (vm *VM) storeCVMove(idx uint32, v types.Value) {
 	types.ReleaseValue(vm.Zone, &old)
 }
 
+// opUnpackIntoArray déploie dans le tableau littéral en construction un tableau ou un Traversable : clés
+// entières renumérotées, clés chaînes écrasant la valeur précédente comme en PHP 8.1.
+func (vm *VM) opUnpackIntoArray() {
+	src := vm.pop()
+	arr := vm.pop()
+	if vm.stop {
+		vmRelease(vm.Zone, &src)
+		vmRelease(vm.Zone, &arr)
+		return
+	}
+	d := types.Deref(vm.Zone, src)
+	items := d
+	owned := false
+	if d.Type == types.TypeObject {
+		collected, ok := vm.collectTraversable(d, true)
+		if !ok {
+			vmRelease(vm.Zone, &src)
+			vmRelease(vm.Zone, &arr)
+			if !vm.stop && !vm.control {
+				vm.raiseBuiltin(bytecode.ClassError, "Only arrays and Traversables can be unpacked", 0)
+			}
+			return
+		}
+		items, owned = collected, true
+	} else if d.Type != types.TypeArray {
+		vmRelease(vm.Zone, &src)
+		vmRelease(vm.Zone, &arr)
+		vm.raiseBuiltin(bytecode.ClassError, "Only arrays and Traversables can be unpacked", 0)
+		return
+	}
+	var err error
+	types.ArrayForEach(vm.Zone, items, func(k, v types.Value) bool {
+		v = types.Deref(vm.Zone, v)
+		if k.Type == types.TypeString {
+			err = types.ArraySet(vm.Zone, &arr, k, v, nil)
+		} else {
+			err = types.ArrayAppend(vm.Zone, &arr, v)
+		}
+		return err == nil
+	})
+	if owned {
+		types.ReleaseValue(vm.Zone, &items)
+	}
+	vmRelease(vm.Zone, &src)
+	if err != nil {
+		vmRelease(vm.Zone, &arr)
+		vm.raiseBuiltin(bytecode.ClassError, err.Error(), 0)
+		return
+	}
+	vm.push(arr)
+	vm.bump()
+}

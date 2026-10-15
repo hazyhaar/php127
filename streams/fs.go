@@ -2,22 +2,30 @@ package streams
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"code.hazyhaar.fr/devhoros/php127/stdlib"
 	"code.hazyhaar.fr/devhoros/php127/types"
 	"code.hazyhaar.fr/devhoros/php127/zone"
 )
 
-func readSourceBytes(zs *ZoneStreams, out io.Writer, filename string) ([]byte, error) {
-	if strings.HasPrefix(filename, "php://") || strings.HasPrefix(filename, "data://") || strings.HasPrefix(filename, "data:") {
-		h, err := openStream(zs, out, filename, "rb")
+// readSourceBytes lit une source entière pour fn ; un protocole utilisateur passe par openStream, jamais
+// par le système de fichiers local, et son refus est signalé par l'avertissement de fn.
+func readSourceBytes(zs *ZoneStreams, out io.Writer, fn, filename string, ctxID uint32) ([]byte, error) {
+	if strings.HasPrefix(filename, "php://") || strings.HasPrefix(filename, "data://") || strings.HasPrefix(filename, "data:") || zs.isUserScheme(filename) {
+		h, err := openStream(zs, out, filename, "rb", ctxID)
 		if err != nil {
+			warnOpenFailure(out, fn, filename, err)
 			return nil, err
 		}
 		defer func() { _ = h.closeOS() }()
@@ -42,6 +50,14 @@ func nativeFileGetContents(z *zone.Zone, out io.Writer, args []types.Value) (typ
 	if err != nil {
 		return types.Value{}, err
 	}
+	var ctxID uint32
+	if len(args) >= 3 && !deref(z, args[2]).IsNull() {
+		ctx, ok := lookupContext(z, args[2])
+		if !ok {
+			return types.Value{}, typeErr("file_get_contents", "3", "context", "resource", typeKind(z, deref(z, args[2])))
+		}
+		ctxID = ctx.slotID
+	}
 	offset := int64(0)
 	if len(args) >= 4 && !deref(z, args[3]).IsNull() {
 		offset, err = asIntParam(z, args[3], "file_get_contents", "4", "offset")
@@ -62,7 +78,7 @@ func nativeFileGetContents(z *zone.Zone, out io.Writer, args []types.Value) (typ
 		hasLen = true
 	}
 	zs := getZoneStreams(z)
-	data, err := readSourceBytes(zs, out, filename)
+	data, err := readSourceBytes(zs, out, "file_get_contents", filename, ctxID)
 	if err != nil {
 		return types.NewBool(false), nil
 	}
@@ -99,6 +115,14 @@ func nativeFilePutContents(z *zone.Zone, out io.Writer, args []types.Value) (typ
 		if err != nil {
 			return types.Value{}, err
 		}
+	}
+	var ctxID uint32
+	if len(args) == 4 && !deref(z, args[3]).IsNull() {
+		ctx, ok := lookupContext(z, args[3])
+		if !ok {
+			return types.Value{}, typeErr("file_put_contents", "4", "context", "resource", typeKind(z, deref(z, args[3])))
+		}
+		ctxID = ctx.slotID
 	}
 	zs := getZoneStreams(z)
 	dataVal := deref(z, args[1])
@@ -137,15 +161,25 @@ func nativeFilePutContents(z *zone.Zone, out io.Writer, args []types.Value) (typ
 		payload = []byte(s)
 	}
 
-	if strings.HasPrefix(filename, "php://") {
-		h, err := openStream(zs, out, filename, "wb")
+	if strings.HasPrefix(filename, "php://") || zs.isUserScheme(filename) {
+		mode := "wb"
+		if flags&FILE_APPEND != 0 {
+			mode = "ab"
+		}
+		h, err := openStream(zs, out, filename, mode, ctxID)
 		if err != nil {
+			warnOpenFailure(out, "file_put_contents", filename, err)
 			return types.NewBool(false), nil
 		}
 		defer func() { _ = h.closeOS() }()
 		n, err := h.writeBytes(payload)
 		if err != nil {
 			return types.NewBool(false), nil
+		}
+		if h.kind == backendUser && len(h.closers) > 0 {
+			if flusher, ok := h.closers[0].(interface{ Flush() bool }); ok {
+				_ = flusher.Flush()
+			}
 		}
 		return types.NewLong(int64(n)), nil
 	}
@@ -157,7 +191,7 @@ func nativeFilePutContents(z *zone.Zone, out io.Writer, args []types.Value) (typ
 	} else {
 		openFlags |= os.O_TRUNC
 	}
-	f, err := os.OpenFile(resolved, openFlags, 0o666)
+	f, err := zs.openFile(resolved, openFlags)
 	if err != nil {
 		return types.NewBool(false), nil
 	}
@@ -188,8 +222,16 @@ func nativeFile(z *zone.Zone, out io.Writer, args []types.Value) (types.Value, e
 			return types.Value{}, err
 		}
 	}
+	var ctxID uint32
+	if len(args) == 3 && !deref(z, args[2]).IsNull() {
+		ctx, ok := lookupContext(z, args[2])
+		if !ok {
+			return types.Value{}, typeErr("file", "3", "context", "resource", typeKind(z, deref(z, args[2])))
+		}
+		ctxID = ctx.slotID
+	}
 	zs := getZoneStreams(z)
-	data, err := readSourceBytes(zs, out, filename)
+	data, err := readSourceBytes(zs, out, "file", filename, ctxID)
 	if err != nil {
 		return types.NewBool(false), nil
 	}
@@ -249,8 +291,16 @@ func nativeReadfile(z *zone.Zone, out io.Writer, args []types.Value) (types.Valu
 	if err != nil {
 		return types.Value{}, err
 	}
+	var ctxID uint32
+	if len(args) == 3 && !deref(z, args[2]).IsNull() {
+		ctx, ok := lookupContext(z, args[2])
+		if !ok {
+			return types.Value{}, typeErr("readfile", "3", "context", "resource", typeKind(z, deref(z, args[2])))
+		}
+		ctxID = ctx.slotID
+	}
 	zs := getZoneStreams(z)
-	data, err := readSourceBytes(zs, out, filename)
+	data, err := readSourceBytes(zs, out, "readfile", filename, ctxID)
 	if err != nil {
 		return types.NewBool(false), nil
 	}
@@ -559,12 +609,26 @@ func nativeCopy(z *zone.Zone, out io.Writer, args []types.Value) (types.Value, e
 	if err != nil {
 		return types.Value{}, err
 	}
+	var ctxID uint32
+	if len(args) == 3 && !deref(z, args[2]).IsNull() {
+		ctx, ok := lookupContext(z, args[2])
+		if !ok {
+			return types.Value{}, typeErr("copy", "3", "context", "resource", typeKind(z, deref(z, args[2])))
+		}
+		ctxID = ctx.slotID
+	}
 	zs := getZoneStreams(z)
-	data, err := readSourceBytes(zs, out, from)
+	data, err := readSourceBytes(zs, out, "copy", from, ctxID)
 	if err != nil {
 		return types.NewBool(false), nil
 	}
-	return types.NewBool(os.WriteFile(zs.resolvePath(to), data, 0o666) == nil), nil
+	f, err := zs.openFile(zs.resolvePath(to), os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	if err != nil {
+		return types.NewBool(false), nil
+	}
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	return types.NewBool(werr == nil && cerr == nil), nil
 }
 
 func nativeMkdir(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
@@ -592,9 +656,12 @@ func nativeMkdir(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, er
 		if fi, statErr := os.Stat(resolved); statErr == nil && fi.IsDir() {
 			return types.NewBool(false), nil
 		}
-		return types.NewBool(os.MkdirAll(resolved, os.FileMode(perm)&0o777) == nil), nil
+		return types.NewBool(zs.mkdirAll(resolved, os.FileMode(perm)&0o777) == nil), nil
 	}
-	return types.NewBool(os.Mkdir(resolved, os.FileMode(perm)&0o777) == nil), nil
+	if err := zs.mkdirCreated(resolved, os.FileMode(perm)&0o777); err != nil {
+		return types.NewBool(false), nil
+	}
+	return types.NewBool(true), nil
 }
 
 func nativeRmdir(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
@@ -747,9 +814,7 @@ func nativeGlob(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, err
 		searchPat := pat
 		baseDir := ""
 		if isRel {
-			zs.mu.Lock()
-			baseDir = zs.cwd
-			zs.mu.Unlock()
+			baseDir = zs.currentDir()
 			if baseDir != "" {
 				searchPat = filepath.Join(baseDir, pat)
 			}
@@ -1025,10 +1090,7 @@ func nativeGetcwd(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, e
 	if err := arity("getcwd", len(args), 0, 0); err != nil {
 		return types.Value{}, err
 	}
-	zs := getZoneStreams(z)
-	zs.mu.Lock()
-	cwd := zs.cwd
-	zs.mu.Unlock()
+	cwd := getZoneStreams(z).currentDir()
 	if cwd == "" {
 		var err error
 		cwd, err = os.Getwd()
@@ -1057,10 +1119,30 @@ func nativeChdir(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, er
 	if err != nil {
 		return types.NewBool(false), nil
 	}
-	zs.mu.Lock()
-	zs.cwd = abs
-	zs.mu.Unlock()
+	zs.setCurrentDir(abs)
 	return types.NewBool(true), nil
+}
+
+// currentDir rend le répertoire courant de la Zone, partagé avec les autres paquets (stdlib) par zone.Zone ;
+// zs.cwd ne sert que l'état de la Zone nil.
+func (zs *ZoneStreams) currentDir() string {
+	if zs.zone != nil {
+		return zs.zone.Cwd()
+	}
+	zs.mu.Lock()
+	defer zs.mu.Unlock()
+	return zs.cwd
+}
+
+// setCurrentDir pose le répertoire courant de la Zone, copié hors de l'arène.
+func (zs *ZoneStreams) setCurrentDir(dir string) {
+	if zs.zone != nil {
+		zs.zone.SetCwd(dir)
+		return
+	}
+	zs.mu.Lock()
+	zs.cwd = strings.Clone(dir)
+	zs.mu.Unlock()
 }
 
 func resolveDirArg(z *zone.Zone, args []types.Value, fn string) (*ZoneStreams, *dirHandle, error) {
@@ -1112,7 +1194,7 @@ func nativeOpendir(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, 
 	entries = append(entries, ".", "..")
 	entries = append(entries, names...)
 	d := &dirHandle{
-		path:    resolved,
+		path:    strings.Clone(resolved),
 		entries: entries,
 	}
 	return zs.registerDir(d), nil
@@ -1190,7 +1272,7 @@ func nativeTouch(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, er
 	zs := getZoneStreams(z)
 	resolved := zs.resolvePath(filename)
 	if _, statErr := os.Stat(resolved); statErr != nil {
-		f, createErr := os.OpenFile(resolved, os.O_CREATE|os.O_WRONLY, 0o666)
+		f, createErr := zs.openFile(resolved, os.O_CREATE|os.O_WRONLY)
 		if createErr != nil {
 			return types.NewBool(false), nil
 		}
@@ -1217,4 +1299,310 @@ func nativeChmod(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, er
 	zs := getZoneStreams(z)
 	resolved := zs.resolvePath(filename)
 	return types.NewBool(os.Chmod(resolved, os.FileMode(perm)&0o777) == nil), nil
+}
+
+// Lot 7.3 : fonctions de système de fichiers sollicitées par WordPress.
+
+func nativeClearstatcache(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("clearstatcache", len(args), 0, 2); err != nil {
+		return types.Value{}, err
+	}
+	if len(args) == 2 {
+		if _, err := asStringParam(z, args[1], "clearstatcache", "2", "filename"); err != nil {
+			return types.Value{}, err
+		}
+	}
+	return types.NewNull(), nil
+}
+
+// umask lit ou pose le masque de création de la Zone, porté par zone.Zone et partagé avec stdlib ; le masque
+// du processus, partagé par les Zones concurrentes, n'est jamais modifié. z.Reset rend zone.DefaultUmask.
+func nativeUmask(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("umask", len(args), 0, 1); err != nil {
+		return types.Value{}, err
+	}
+	zs := getZoneStreams(z)
+	if len(args) == 0 || deref(z, args[0]).IsNull() {
+		return types.NewLong(int64(zs.mask())), nil
+	}
+	m, err := asIntParam(z, args[0], "umask", "1", "mask")
+	if err != nil {
+		return types.Value{}, err
+	}
+	if zs.zone != nil {
+		return types.NewLong(int64(zs.zone.SetUmask(int(m & 0o777)))), nil
+	}
+	zs.mu.Lock()
+	old := zs.umask
+	zs.umask = int(m & 0o777)
+	zs.mu.Unlock()
+	return types.NewLong(int64(old)), nil
+}
+
+// mask rend le masque de création de la Zone ; zs.umask ne sert que l'état de la Zone nil.
+func (zs *ZoneStreams) mask() int {
+	if zs.zone != nil {
+		return zs.zone.Umask()
+	}
+	zs.mu.Lock()
+	defer zs.mu.Unlock()
+	return zs.umask
+}
+
+// createMode rend perm privé du masque de création de la Zone.
+func (zs *ZoneStreams) createMode(perm os.FileMode) os.FileMode {
+	if zs.zone != nil {
+		return zs.zone.CreateMode(perm)
+	}
+	return perm &^ os.FileMode(zs.mask()) & 0o777
+}
+
+// openFile ouvre un fichier ordinaire ; un fichier créé par l'appel reçoit 0666 privé du masque de la Zone.
+// La création passe directement ce mode au noyau, qui retire en outre le masque du processus : le fichier
+// n'est jamais publié avec plus de droits que demandé. O_EXCL désigne sans ambiguïté le créateur, seul à
+// élargir ensuite les droits vers le mode exact ; un échec de cet élargissement annule la création.
+func (zs *ZoneStreams) openFile(path string, flag int) (*os.File, error) {
+	if flag&os.O_CREATE == 0 {
+		return os.OpenFile(path, flag, 0o666)
+	}
+	mode := zs.createMode(0o666)
+	for range 2 {
+		f, err := os.OpenFile(path, flag|os.O_EXCL, mode)
+		if err == nil {
+			if cerr := f.Chmod(mode); cerr != nil {
+				_ = f.Close()
+				_ = os.Remove(path)
+				return nil, cerr
+			}
+			return f, nil
+		}
+		if flag&os.O_EXCL != 0 || !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+		f, err = os.OpenFile(path, flag&^os.O_CREATE, 0)
+		if err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return f, err
+		}
+	}
+	// Un lien symbolique pendant fait échouer O_EXCL puis l'ouverture sans création : la cible est créée
+	// au travers du lien avec le mode restreint, sans élargissement puisque son créateur n'est pas établi.
+	return os.OpenFile(path, flag, mode)
+}
+
+// mkdirCreated crée le répertoire path avec perm privé du masque de la Zone, puis élargit ses droits
+// vers ce mode exact par le descripteur du répertoire créé ; un échec annule la création.
+func (zs *ZoneStreams) mkdirCreated(path string, perm os.FileMode) error {
+	mode := zs.createMode(perm)
+	if err := os.Mkdir(path, mode); err != nil {
+		return err
+	}
+	d, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err == nil {
+		err = d.Chmod(mode)
+		_ = d.Close()
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+// mkdirAll crée path et ses ascendants absents, du plus haut au plus profond, chacun par mkdirCreated ;
+// un ascendant créé entre-temps par une autre requête est accepté sans que ses droits soient modifiés.
+func (zs *ZoneStreams) mkdirAll(path string, perm os.FileMode) error {
+	var missing []string
+	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
+		if _, err := os.Lstat(p); err == nil {
+			break
+		}
+		missing = append(missing, p)
+		if filepath.Dir(p) == p {
+			break
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		p := missing[i]
+		err := zs.mkdirCreated(p, perm)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		if fi, serr := os.Stat(p); serr != nil || !fi.IsDir() {
+			return err
+		}
+	}
+	return nil
+}
+
+func nativeDiskSpace(fn string, total bool) func(*zone.Zone, io.Writer, []types.Value) (types.Value, error) {
+	return func(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+		if err := arity(fn, len(args), 1, 1); err != nil {
+			return types.Value{}, err
+		}
+		dir, err := asStringParam(z, args[0], fn, "1", "directory")
+		if err != nil {
+			return types.Value{}, err
+		}
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(getZoneStreams(z).resolvePath(dir), &st); err != nil {
+			return types.NewBool(false), nil
+		}
+		unit := float64(st.Frsize)
+		if unit == 0 {
+			unit = float64(st.Bsize)
+		}
+		if total {
+			return types.NewDouble(float64(st.Blocks) * unit), nil
+		}
+		return types.NewDouble(float64(st.Bavail) * unit), nil
+	}
+}
+
+func nativeLink(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("link", len(args), 2, 2); err != nil {
+		return types.Value{}, err
+	}
+	target, err := asStringParam(z, args[0], "link", "1", "target")
+	if err != nil {
+		return types.Value{}, err
+	}
+	link, err := asStringParam(z, args[1], "link", "2", "link")
+	if err != nil {
+		return types.Value{}, err
+	}
+	zs := getZoneStreams(z)
+	return types.NewBool(os.Link(zs.resolvePath(target), zs.resolvePath(link)) == nil), nil
+}
+
+// symlink conserve la cible telle quelle, comme symlink(2) appelé par PHP.
+func nativeSymlink(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("symlink", len(args), 2, 2); err != nil {
+		return types.Value{}, err
+	}
+	target, err := asStringParam(z, args[0], "symlink", "1", "target")
+	if err != nil {
+		return types.Value{}, err
+	}
+	link, err := asStringParam(z, args[1], "symlink", "2", "link")
+	if err != nil {
+		return types.Value{}, err
+	}
+	return types.NewBool(os.Symlink(target, getZoneStreams(z).resolvePath(link)) == nil), nil
+}
+
+func nativeReadlink(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("readlink", len(args), 1, 1); err != nil {
+		return types.Value{}, err
+	}
+	p, err := asStringParam(z, args[0], "readlink", "1", "path")
+	if err != nil {
+		return types.Value{}, err
+	}
+	dst, err := os.Readlink(getZoneStreams(z).resolvePath(p))
+	if err != nil {
+		return types.NewBool(false), nil
+	}
+	return newStr(z, dst)
+}
+
+// ownerID résout un argument string|int en identifiant numérique d'utilisateur ou de groupe.
+func ownerID(z *zone.Zone, v types.Value, fn, param string, group bool) (int, bool, error) {
+	v = deref(z, v)
+	switch v.Type {
+	case types.TypeLong:
+		return int(v.ToLong()), true, nil
+	case types.TypeString:
+		name := types.StringData(z, v)
+		var id string
+		if group {
+			g, err := user.LookupGroup(name)
+			if err != nil {
+				return 0, false, nil
+			}
+			id = g.Gid
+		} else {
+			u, err := user.Lookup(name)
+			if err != nil {
+				return 0, false, nil
+			}
+			id = u.Uid
+		}
+		n, err := strconv.Atoi(id)
+		return n, err == nil, nil
+	default:
+		return 0, false, typeErr(fn, "2", param, "string|int", typeKind(z, v))
+	}
+}
+
+func nativeChown(fn string, group bool) func(*zone.Zone, io.Writer, []types.Value) (types.Value, error) {
+	param := "user"
+	if group {
+		param = "group"
+	}
+	return func(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+		if err := arity(fn, len(args), 2, 2); err != nil {
+			return types.Value{}, err
+		}
+		filename, err := asStringParam(z, args[0], fn, "1", "filename")
+		if err != nil {
+			return types.Value{}, err
+		}
+		id, ok, err := ownerID(z, args[1], fn, param, group)
+		if err != nil || !ok {
+			return types.NewBool(false), err
+		}
+		uid, gid := id, -1
+		if group {
+			uid, gid = -1, id
+		}
+		return types.NewBool(os.Chown(getZoneStreams(z).resolvePath(filename), uid, gid) == nil), nil
+	}
+}
+
+func nativeParseIniFile(z *zone.Zone, out io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("parse_ini_file", len(args), 1, 3); err != nil {
+		return types.Value{}, err
+	}
+	filename, err := asStringParam(z, args[0], "parse_ini_file", "1", "filename")
+	if err != nil {
+		return types.Value{}, err
+	}
+	if filename == "" {
+		return types.Value{}, ValueError{"parse_ini_file(): Argument #1 ($filename) cannot be empty"}
+	}
+	sections, mode, err := stdlib.INIArgs(z, "parse_ini_file", args)
+	if err != nil {
+		return types.Value{}, err
+	}
+	data, err := readSourceBytes(getZoneStreams(z), out, "parse_ini_file", filename, 0)
+	if err != nil {
+		return types.NewBool(false), nil
+	}
+	return stdlib.ParseINI(z, string(data), sections, mode)
+}
+
+func nativeGetimagesize(z *zone.Zone, out io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("getimagesize", len(args), 1, 2); err != nil {
+		return types.Value{}, err
+	}
+	filename, err := asStringParam(z, args[0], "getimagesize", "1", "filename")
+	if err != nil {
+		return types.Value{}, err
+	}
+	if filename == "" {
+		return types.Value{}, ValueError{"getimagesize(): Argument #1 ($filename) cannot be empty"}
+	}
+	data, err := readSourceBytes(getZoneStreams(z), out, "getimagesize", filename, 0)
+	if err != nil {
+		if len(args) == 2 {
+			if arr, aerr := types.NewArray(z); aerr == nil {
+				assignRefArg(z, args, 1, arr)
+			}
+		}
+		return types.NewBool(false), nil
+	}
+	return stdlib.ImageSize(z, data, args, 1)
 }

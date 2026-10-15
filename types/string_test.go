@@ -965,3 +965,97 @@ func TestFormatLongAndConcatStringLong(t *testing.T) {
 	}
 }
 
+func TestProcessZoneArraySnapshotAndCOW(t *testing.T) {
+	ResetProcessZone()
+	defer ResetProcessZone()
+	ReserveProcessZone(512 << 10)
+
+	bootZone := zone.New(65536)
+	outer, err := NewArray(bootZone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := NewArray(bootZone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hrefKey := stringValue(t, bootZone, "href", 0)
+	if err := ArraySet(bootZone, &inner, hrefKey, NewBool(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	ReleaseString(bootZone, &hrefKey)
+	aKey := stringValue(t, bootZone, "a", 0)
+	if err := ArraySet(bootZone, &outer, aKey, inner, nil); err != nil {
+		t.Fatal(err)
+	}
+	ReleaseString(bootZone, &aKey)
+	ReleaseArray(bootZone, &inner)
+
+	frozenArr, err := InternProcessValue(bootZone, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ReleaseArray(bootZone, &outer)
+	bootZone.Reset(nil)
+	FreezeProcessZone()
+
+	if frozenArr.Flags != FlagImmutable|FlagInterned {
+		t.Fatalf("frozenArr.Flags = %v, want FlagImmutable|FlagInterned", frozenArr.Flags)
+	}
+
+	reqZone := zone.New(65536)
+	kA := stringValue(t, reqZone, "a", 0)
+	kHref := stringValue(t, reqZone, "href", 0)
+	beforeLive := reqZone.LiveBytes()
+
+	sub, ok, err := ArrayGet(reqZone, frozenArr, kA, nil)
+	if err != nil || !ok {
+		t.Fatalf("ArrayGet('a'): ok=%v err=%v", ok, err)
+	}
+	val, ok, err := ArrayGet(reqZone, sub, kHref, nil)
+	if err != nil || !ok || !val.IsBool() || !val.ToBool() {
+		t.Fatalf("ArrayGet('href'): val=%+v ok=%v err=%v", val, ok, err)
+	}
+	if reqZone.LiveBytes() != beforeLive {
+		t.Fatalf("read allocated %d bytes in request zone", reqZone.LiveBytes()-beforeLive)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected panic on direct write to processZone")
+			}
+		}()
+		tmp := frozenArr
+		_ = ArraySet(processZone, &tmp, kA, NewLong(1), nil)
+	}()
+
+	mutated := RetainArray(reqZone, frozenArr)
+	newSub := RetainArray(reqZone, sub)
+	if err := ArraySet(reqZone, &newSub, kHref, NewBool(false), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ArraySet(reqZone, &mutated, kA, newSub, nil); err != nil {
+		t.Fatal(err)
+	}
+	ReleaseArray(reqZone, &newSub)
+
+	if mutated.Flags&FlagZoneRequest == 0 {
+		t.Fatal("expected mutated array to be separated into request zone")
+	}
+	origSub, ok, err := ArrayGet(reqZone, frozenArr, kA, nil)
+	if err != nil || !ok {
+		t.Fatalf("orig ArrayGet('a'): ok=%v err=%v", ok, err)
+	}
+	origVal, ok, err := ArrayGet(reqZone, origSub, kHref, nil)
+	if err != nil || !ok || !origVal.ToBool() {
+		t.Fatalf("processZone array was corrupted: origVal=%+v ok=%v err=%v", origVal, ok, err)
+	}
+
+	ReleaseArray(reqZone, &mutated)
+	ReleaseString(reqZone, &kA)
+	ReleaseString(reqZone, &kHref)
+	if reqZone.LiveBytes() != 0 {
+		t.Fatalf("reqZone leaked %d bytes", reqZone.LiveBytes())
+	}
+}

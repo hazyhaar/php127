@@ -25,7 +25,59 @@ const (
 	JSON_UNESCAPED_UNICODE        = 256
 	JSON_THROW_ON_ERROR           = 4194304
 	jsonDefaultDepth              = 512
+
+	jsonErrorNone        = 0
+	jsonErrorDepth       = 1
+	jsonErrorSyntax      = 4
+	jsonErrorUTF8        = 5
+	jsonErrorInfNaN      = 7
+	jsonErrorUnsupported = 8
 )
+
+// jsonErrorMessages reprend les libellés de json_last_error_msg de PHP 8.3.
+var jsonErrorMessages = map[int64]string{
+	jsonErrorNone:        "No error",
+	jsonErrorDepth:       "Maximum stack depth exceeded",
+	jsonErrorSyntax:      "Syntax error",
+	jsonErrorUTF8:        "Malformed UTF-8 characters, possibly incorrectly encoded",
+	jsonErrorInfNaN:      "Inf and NaN cannot be JSON encoded",
+	jsonErrorUnsupported: "Type is not supported",
+}
+
+// setJSONError consigne le code de la dernière opération JSON de la Zone.
+func setJSONError(z *zone.Zone, code int64) {
+	sysStateFor(z).jsonErr = code
+}
+
+func nativeJSONLastError(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("json_last_error", len(args), 0, 0); err != nil {
+		return types.Value{}, err
+	}
+	code := sysStateFor(z).jsonErr
+	return types.NewLong(code), nil
+}
+
+func nativeJSONLastErrorMsg(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("json_last_error_msg", len(args), 0, 0); err != nil {
+		return types.Value{}, err
+	}
+	code := sysStateFor(z).jsonErr
+	msg, ok := jsonErrorMessages[code]
+	if !ok {
+		msg = "Unknown error"
+	}
+	return newStr(z, msg)
+}
+
+// jsonEncodeErrorCode rend le code PHP d'un échec d'encodage d'après son libellé.
+func jsonEncodeErrorCode(err error) int64 {
+	for code, msg := range jsonErrorMessages {
+		if code != jsonErrorNone && err.Error() == msg {
+			return code
+		}
+	}
+	return jsonErrorUnsupported
+}
 
 type prop struct {
 	key string
@@ -87,7 +139,11 @@ func nativeJSONEncode(z *zone.Zone, _ io.Writer, args []types.Value) (types.Valu
 		if flags&JSON_THROW_ON_ERROR != 0 {
 			return types.Value{}, JsonException{err.Error()}
 		}
+		setJSONError(z, jsonEncodeErrorCode(err))
 		return types.NewBool(false), nil
+	}
+	if flags&JSON_THROW_ON_ERROR == 0 {
+		setJSONError(z, jsonErrorNone)
 	}
 	return newStr(z, b.String())
 }
@@ -324,26 +380,45 @@ func nativeJSONDecode(z *zone.Zone, _ io.Writer, args []types.Value) (types.Valu
 			return types.Value{}, err
 		}
 	}
+	if flags&jsonObjectAsArray != 0 && (len(args) < 2 || deref(z, args[1]).Type == types.TypeNull) {
+		assoc = true
+	}
 	d := &jdec{s: s, z: z, assoc: assoc, max: int(depth)}
 	d.skip()
 	if d.i >= len(d.s) {
-		return jsonFail(flags)
+		return jsonFail(z, flags, jsonErrorSyntax)
 	}
 	v, err := d.value(1)
 	if err != nil {
-		return jsonFail(flags)
+		code := int64(jsonErrorSyntax)
+		if e, ok := err.(Error); ok && e.text == "depth" {
+			code = jsonErrorDepth
+		}
+		return jsonFail(z, flags, code)
 	}
 	d.skip()
 	if d.i != len(d.s) {
-		return jsonFail(flags)
+		types.ReleaseValue(z, &v)
+		return jsonFail(z, flags, jsonErrorSyntax)
+	}
+	if !utf8.ValidString(s) {
+		types.ReleaseValue(z, &v)
+		return jsonFail(z, flags, jsonErrorUTF8)
+	}
+	if flags&JSON_THROW_ON_ERROR == 0 {
+		setJSONError(z, jsonErrorNone)
 	}
 	return v, nil
 }
 
-func jsonFail(flags int64) (types.Value, error) {
+const jsonObjectAsArray = 1
+
+// jsonFail lève JsonException sous JSON_THROW_ON_ERROR, sinon consigne le code pour json_last_error et rend null.
+func jsonFail(z *zone.Zone, flags, code int64) (types.Value, error) {
 	if flags&JSON_THROW_ON_ERROR != 0 {
-		return types.Value{}, JsonException{"Syntax error"}
+		return types.Value{}, JsonException{jsonErrorMessages[code]}
 	}
+	setJSONError(z, code)
 	return types.NewNull(), nil
 }
 

@@ -222,11 +222,25 @@ func arrayData(z *zone.Zone, h *ArrayHeader) ([]Bucket, []uint32) {
 	return buckets, unsafe.Slice((*uint32)(unsafe.Pointer(&raw[h.Cap*bucketSize])), h.Cap)
 }
 
-func arrayHeader(z *zone.Zone, v Value) *ArrayHeader {
-	if v.Type != TypeArray || v.Flags&FlagZoneRequest == 0 || v.DataSlot%8 != 0 {
+func arrayStorageZone(z *zone.Zone, v Value) *zone.Zone {
+	if v.Type != TypeArray || v.DataSlot%8 != 0 {
 		panic("types: invalid array value")
 	}
-	raw, err := z.Bytes(v.DataSlot, arrayHeaderSize)
+	if v.Flags&FlagZoneRequest == 0 {
+		if v.Flags&^FlagTainted != FlagImmutable|FlagInterned || v.Extra != 0 {
+			panic("types: invalid process array")
+		}
+		return processZone
+	}
+	if z == nil {
+		panic("types: request array requires a Zone")
+	}
+	return z
+}
+
+func arrayHeader(z *zone.Zone, v Value) *ArrayHeader {
+	az := arrayStorageZone(z, v)
+	raw, err := az.Bytes(v.DataSlot, arrayHeaderSize)
 	if err != nil {
 		panic(err)
 	}
@@ -280,6 +294,9 @@ func NewArray(z *zone.Zone) (Value, error) { return allocArray(z, ArrayPacked, 8
 
 func RetainArray(z *zone.Zone, v Value) Value {
 	h := arrayHeader(z, v)
+	if v.Flags&FlagZoneRequest == 0 {
+		return v
+	}
 	if h.RefCount == math.MaxUint32 {
 		panic("types: array reference count overflow")
 	}
@@ -298,6 +315,8 @@ func RetainValue(z *zone.Zone, v Value) Value {
 		return RetainArray(z, v)
 	case TypeObject:
 		return RetainObject(z, v)
+	case TypeResource:
+		return v
 	case TypeReference:
 		return RetainReference(z, v)
 	default:
@@ -320,6 +339,8 @@ func ReleaseValue(z *zone.Zone, v *Value) {
 		ReleaseArray(z, v)
 	case TypeObject:
 		ReleaseObject(z, v)
+	case TypeResource:
+		*v = Value{}
 	case TypeReference:
 		ReleaseReference(z, v)
 	default:
@@ -332,6 +353,10 @@ func ReleaseValue(z *zone.Zone, v *Value) {
 
 func ReleaseArray(z *zone.Zone, v *Value) {
 	h := arrayHeader(z, *v)
+	if v.Flags&FlagZoneRequest == 0 {
+		*v = Value{}
+		return
+	}
 	h.RefCount--
 	if h.RefCount == 0 {
 		gcUnbuffer(z, *v)
@@ -389,8 +414,8 @@ func arrayKeySame(z *zone.Zone, a, b Value) bool {
 	return bytes.Equal(StringBytes(z, a), StringBytes(z, b))
 }
 
-func arrayFind(z *zone.Zone, h *ArrayHeader, key Value, hash uint64) uint32 {
-	b, slots := arrayData(z, h)
+func arrayFind(z, az *zone.Zone, h *ArrayHeader, key Value, hash uint64) uint32 {
+	b, slots := arrayData(az, h)
 	if h.Kind == ArrayPacked {
 		if key.Type == TypeLong && key.Scalar < uint64(h.Used) && !b[key.Scalar].Val.IsUndef() {
 			return uint32(key.Scalar)
@@ -417,17 +442,18 @@ func ArrayGet(z *zone.Zone, a, key Value, warn func(ArrayWarning) error) (Value,
 	if a.Type != TypeArray {
 		return Value{}, false, nil
 	}
+	az := arrayStorageZone(z, a)
 	h := arrayHeader(z, a)
 	hash := arrayKeyHash(z, key)
 	if key.Type == TypeString && key.Flags&FlagZoneRequest != 0 {
 		sh, _ := stringStorage(z, key)
 		sh.Hash = hash
 	}
-	i := arrayFind(z, h, key, hash)
+	i := arrayFind(z, az, h, key, hash)
 	if i == EmptySlot {
 		return Value{}, false, nil
 	}
-	b, _ := arrayData(z, h)
+	b, _ := arrayData(az, h)
 	return b[i].Val, true, nil
 }
 
@@ -465,8 +491,13 @@ func rebuildArray(z *zone.Zone, h *ArrayHeader) {
 // writableArray prepares every fallible allocation before publishing. Copying
 // transfers ownership for a unique owner and retains each child for CoW.
 func writableArray(z *zone.Zone, a *Value, kind ArrayKind, capacity uint32, compact bool) error {
+	if z == nil || z == processZone {
+		panic("types: write to process zone is forbidden")
+	}
+	az := arrayStorageZone(z, *a)
 	h := arrayHeader(z, *a)
-	shared := h.RefCount > 1
+	isProcess := a.Flags&FlagZoneRequest == 0
+	shared := isProcess || h.RefCount > 1
 	if !shared && kind == h.Kind && capacity == h.Cap {
 		if compact {
 			b, _ := arrayData(z, h)
@@ -506,7 +537,7 @@ func writableArray(z *zone.Zone, a *Value, kind ArrayKind, capacity uint32, comp
 		}
 		nh.DataOffset, nh.Kind, nh.Cap = off, kind, capacity
 	}
-	source, _ := arrayData(z, &old)
+	source, _ := arrayData(az, &old)
 	rootHigh := source[0].Pad
 	target, _ := arrayData(z, nh)
 	clear(target)
@@ -543,9 +574,11 @@ func writableArray(z *zone.Zone, a *Value, kind ArrayKind, capacity uint32, comp
 	nh.Len, nh.Used, nh.NextIdx = old.Len, used, old.NextIdx
 	rebuildArray(z, nh)
 	if shared {
-		h.RefCount--
-		gcPossibleRoot(z, *a)
-		next.Flags = a.Flags
+		if !isProcess {
+			h.RefCount--
+			gcPossibleRoot(z, *a)
+		}
+		next.Flags = (a.Flags & FlagTainted) | FlagZoneRequest
 		*a = next
 	} else {
 		size, err := arrayDataSize(old.Kind, old.Cap)
@@ -559,6 +592,18 @@ func writableArray(z *zone.Zone, a *Value, kind ArrayKind, capacity uint32, comp
 	return nil
 }
 
+// SeparateArray sépare en écriture (CoW) un tableau partagé (RefCount > 1), y compris lorsqu'il est vide.
+func SeparateArray(z *zone.Zone, a *Value) error {
+	if a.Type == TypeReference {
+		a = &refCell(z, *a).Target
+	}
+	if a.Type != TypeArray {
+		return ErrArrayValue
+	}
+	h := arrayHeader(z, *a)
+	return writableArray(z, a, h.Kind, h.Cap, false)
+}
+
 // ArraySet borrows key and val and retains what it stores. The caller keeps its
 // owners on both success and failure. All request-backed arguments belong to z.
 func ArraySet(z *zone.Zone, a *Value, key, val Value, warn func(ArrayWarning) error) error {
@@ -568,7 +613,7 @@ func ArraySet(z *zone.Zone, a *Value, key, val Value, warn func(ArrayWarning) er
 	if a.Type != TypeArray {
 		return ErrArrayValue
 	}
-	if val.IsUndef() || val.Type == TypeResource || val.Type > TypeReference {
+	if val.IsUndef() || val.Type > TypeReference {
 		return ErrArrayValue
 	}
 	key, err := NormalizeArrayKey(z, key, warn)
@@ -579,9 +624,13 @@ func ArraySet(z *zone.Zone, a *Value, key, val Value, warn func(ArrayWarning) er
 }
 
 func arraySetNormalized(z *zone.Zone, a *Value, key, val Value) error {
+	if z == nil || z == processZone {
+		panic("types: write to process zone is forbidden")
+	}
+	az := arrayStorageZone(z, *a)
 	h := arrayHeader(z, *a)
 	hash := arrayKeyHash(z, key)
-	idx := arrayFind(z, h, key, hash)
+	idx := arrayFind(z, az, h, key, hash)
 	kind, capacity := h.Kind, h.Cap
 	compact := false
 	if idx == EmptySlot {
@@ -656,28 +705,35 @@ func arraySetNormalized(z *zone.Zone, a *Value, key, val Value) error {
 }
 
 func ArrayAppend(z *zone.Zone, a *Value, val Value) error {
+	if z == nil || z == processZone {
+		panic("types: write to process zone is forbidden")
+	}
 	if a.Type == TypeReference {
 		a = &refCell(z, *a).Target
 	}
 	if a.Type != TypeArray {
 		return ErrArrayValue
 	}
-	if val.IsUndef() || val.Type == TypeResource || val.Type > TypeReference {
+	if val.IsUndef() || val.Type > TypeReference {
 		return ErrArrayValue
 	}
+	az := arrayStorageZone(z, *a)
 	h := arrayHeader(z, *a)
 	k := h.NextIdx
 	if k == math.MinInt64 {
 		k = 0
 	}
 	key := NewLong(k)
-	if k == math.MaxInt64 && arrayFind(z, h, key, arrayKeyHash(z, key)) != EmptySlot {
+	if k == math.MaxInt64 && arrayFind(z, az, h, key, arrayKeyHash(z, key)) != EmptySlot {
 		return ErrArrayOccupied
 	}
 	return arraySetNormalized(z, a, key, val)
 }
 
 func ArrayUnset(z *zone.Zone, a *Value, key Value, warn func(ArrayWarning) error) error {
+	if z == nil || z == processZone {
+		panic("types: write to process zone is forbidden")
+	}
 	if a.Type == TypeReference {
 		a = &refCell(z, *a).Target
 	}
@@ -692,9 +748,10 @@ func ArrayUnset(z *zone.Zone, a *Value, key Value, warn func(ArrayWarning) error
 	if a.Type != TypeArray {
 		return nil
 	}
+	az := arrayStorageZone(z, *a)
 	h := arrayHeader(z, *a)
 	hash := arrayKeyHash(z, key)
-	idx := arrayFind(z, h, key, hash)
+	idx := arrayFind(z, az, h, key, hash)
 	if idx == EmptySlot {
 		return nil
 	}
@@ -732,8 +789,9 @@ func (c *ArrayCursor) Next(z *zone.Zone) (Value, Value, bool) {
 	if c.value.IsUndef() {
 		return Value{}, Value{}, false
 	}
+	az := arrayStorageZone(z, c.value)
 	h := arrayHeader(z, c.value)
-	b, _ := arrayData(z, h)
+	b, _ := arrayData(az, h)
 	for c.next < h.Used {
 		i := c.next
 		c.next++
@@ -761,8 +819,9 @@ func ArrayBucketAt(z *zone.Zone, a Value, start uint32) (Value, uint32, bool) {
 	if a.Type != TypeArray {
 		return Value{}, 0, false
 	}
+	az := arrayStorageZone(z, a)
 	h := arrayHeader(z, a)
-	b, _ := arrayData(z, h)
+	b, _ := arrayData(az, h)
 	for i := start; i < h.Used; i++ {
 		if b[i].Val.IsUndef() {
 			continue
@@ -789,15 +848,16 @@ func ArrayForEach(z *zone.Zone, a Value, visit func(Value, Value) bool) {
 
 func ArrayEqual(z *zone.Zone, a, b Value) bool {
 	a, b = Deref(z, a), Deref(z, b)
+	aza, azb := arrayStorageZone(z, a), arrayStorageZone(z, b)
 	ha, hb := arrayHeader(z, a), arrayHeader(z, b)
-	if a.DataSlot == b.DataSlot {
+	if a.DataSlot == b.DataSlot && aza == azb {
 		return true
 	}
 	if ha.Len != hb.Len {
 		return false
 	}
-	buckets, _ := arrayData(z, ha)
-	other, _ := arrayData(z, hb)
+	buckets, _ := arrayData(aza, ha)
+	other, _ := arrayData(azb, hb)
 	for i := uint32(0); i < ha.Used; i++ {
 		x := buckets[i]
 		if x.Val.IsUndef() {
@@ -808,7 +868,7 @@ func ArrayEqual(z *zone.Zone, a, b Value) bool {
 			key = NewLong(int64(i))
 			hash = arrayKeyHash(z, key)
 		}
-		j := arrayFind(z, hb, key, hash)
+		j := arrayFind(z, azb, hb, key, hash)
 		if j == EmptySlot || !EqualZ(z, x.Val, other[j].Val) {
 			return false
 		}
@@ -818,15 +878,16 @@ func ArrayEqual(z *zone.Zone, a, b Value) bool {
 
 func ArrayIdentical(z *zone.Zone, a, b Value) bool {
 	a, b = Deref(z, a), Deref(z, b)
+	aza, azb := arrayStorageZone(z, a), arrayStorageZone(z, b)
 	ha, hb := arrayHeader(z, a), arrayHeader(z, b)
-	if a.DataSlot == b.DataSlot {
+	if a.DataSlot == b.DataSlot && aza == azb {
 		return true
 	}
 	if ha.Len != hb.Len {
 		return false
 	}
-	ax, _ := arrayData(z, ha)
-	by, _ := arrayData(z, hb)
+	ax, _ := arrayData(aza, ha)
+	by, _ := arrayData(azb, hb)
 	j := uint32(0)
 	for i := uint32(0); i < ha.Used; i++ {
 		if ax[i].Val.IsUndef() {
@@ -860,6 +921,9 @@ func IdenticalZ(z *zone.Zone, a, b Value) bool {
 		objectHeader(z, b)
 		return a.DataSlot == b.DataSlot && a.Extra == b.Extra
 	}
+	if a.Type == TypeResource || b.Type == TypeResource {
+		return a.Type == TypeResource && b.Type == TypeResource && a.DataSlot == b.DataSlot && a.Extra == b.Extra
+	}
 	if a.Type > TypeObject || b.Type > TypeObject {
 		panic("types: comparison of resources/references is not implemented")
 	}
@@ -892,6 +956,8 @@ func boolZ(z *zone.Zone, v Value) bool {
 		return ArrayLen(z, v) != 0
 	case TypeObject:
 		objectHeader(z, v)
+		return true
+	case TypeResource:
 		return true
 	default:
 		return v.ToBool()
@@ -931,14 +997,29 @@ func objectEqual(z *zone.Zone, a, b Value) bool {
 }
 
 // EqualZ owns loose comparison for the currently implemented scalar, string,
-// array and object types. Unsupported future types fail explicitly rather than compare false.
+// array, object and resource types. Unsupported future types fail explicitly rather than compare false.
 func EqualZ(z *zone.Zone, a, b Value) bool {
 	a, b = Deref(z, a), Deref(z, b)
-	if a.Type > TypeObject || b.Type > TypeObject {
+	if a.Type > TypeResource || b.Type > TypeResource {
 		panic("types: comparison of resources/references is not implemented")
 	}
 	if a.IsBool() || b.IsBool() {
 		return boolZ(z, a) == boolZ(z, b)
+	}
+	if a.Type == TypeResource || b.Type == TypeResource {
+		if a.Type == TypeResource && b.Type == TypeResource {
+			return a.DataSlot == b.DataSlot && a.Extra == b.Extra
+		}
+		if a.Type == TypeResource {
+			a, b = b, a
+		}
+		if a.Type == TypeLong {
+			return a.ToLong() == int64(b.DataSlot)
+		}
+		if a.Type == TypeDouble {
+			return a.ToDouble() == float64(b.DataSlot)
+		}
+		return false
 	}
 	if a.Type == TypeObject || b.Type == TypeObject {
 		if a.Type == TypeObject {

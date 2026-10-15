@@ -313,3 +313,164 @@ func BenchmarkAlloc(b *testing.B) {
 		used += 8
 	}
 }
+
+// TestZonePoisonOnFree vérifie que Free remplit d'octets 0xAA la charge utile au-delà de l'en-tête de liste libre,
+// pour un bloc chaîné en liste libre comme pour le bloc de sommet, et la laisse intacte sans le mode poison.
+func TestZonePoisonOnFree(t *testing.T) {
+	for _, size := range []uint32{9, 24, 64, 65, 200} {
+		for _, poison := range []bool{true, false} {
+			z := New(4096)
+			z.SetPoisonOnFree(poison)
+			if z.PoisonOnFree() != poison {
+				t.Fatalf("PoisonOnFree() = %v, attendu %v", z.PoisonOnFree(), poison)
+			}
+			_, span := sizeClass(size)
+			inner, err := z.Alloc(size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			top, err := z.Alloc(size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, off := range []uint32{inner, top} {
+				fillWith(z.memory[off:uint64(off)+span], 0x11)
+			}
+			for _, off := range []uint32{inner, top} {
+				if err := z.Free(off, size); err != nil {
+					t.Fatal(err)
+				}
+				payload := z.memory[uint64(off)+8 : uint64(off)+span]
+				for i, b := range payload {
+					want := byte(0x11)
+					if poison {
+						want = 0xAA
+					}
+					if b != want {
+						t.Fatalf("taille %d poison=%v bloc %d : octet %d = %#x, attendu %#x", size, poison, off, i+8, b, want)
+					}
+				}
+				if rc := z.memory[off : off+4]; !slices.Equal(rc, []byte{0, 0, 0, 0}) {
+					t.Fatalf("compteur de références non nul après Free : %v", rc)
+				}
+			}
+			// Le lien de liste libre survit au poison : le bloc intérieur est réalloué en premier.
+			if got, err := z.Alloc(size); err != nil || got != inner {
+				t.Fatalf("Alloc après Free = %d, %v ; attendu %d", got, err, inner)
+			}
+		}
+	}
+}
+
+func fillWith(b []byte, v byte) {
+	for i := range b {
+		b[i] = v
+	}
+}
+
+// TestZoneSlotsClearedOnReset vérifie la lecture, l'écriture et les bornes des slots, leur présence
+// pendant le drainage des nettoyages et leur remise à nil par Reset.
+func TestZoneSlotsClearedOnReset(t *testing.T) {
+	var nilZone *Zone
+	nilZone.SetSlot(0, 1)
+	if nilZone.Slot(0) != nil {
+		t.Fatal("Slot sur une Zone nil non nil")
+	}
+	z := New(256)
+	for _, id := range []int{-1, MaxSlots} {
+		z.SetSlot(id, "hors bornes")
+		if z.Slot(id) != nil {
+			t.Fatalf("Slot(%d) hors bornes non nil", id)
+		}
+	}
+	for i := range MaxSlots {
+		z.SetSlot(i, i+100)
+	}
+	for i := range MaxSlots {
+		if got := z.Slot(i); got != i+100 {
+			t.Fatalf("Slot(%d) = %v", i, got)
+		}
+	}
+	z.RegisterCleanup(CleanupItem{Kind: CleanupDestructor})
+	seen := false
+	z.Reset(func(CleanupItem) { seen = z.Slot(MaxSlots-1) == MaxSlots-1+100 })
+	if !seen {
+		t.Fatal("slot effacé avant le drainage des nettoyages")
+	}
+	for i := range MaxSlots {
+		if z.Slot(i) != nil {
+			t.Fatalf("Slot(%d) = %v après Reset", i, z.Slot(i))
+		}
+	}
+	z.SetSlot(3, "x")
+	z.Reset(nil)
+	if z.Slot(3) != nil {
+		t.Fatal("Slot(3) non effacé par Reset(nil)")
+	}
+}
+
+// TestSlotConstantsDistinctAndInRange vérifie que chaque paquet du moteur reçoit un slot propre,
+// compris dans [0, MaxSlots), et que les états posés dans deux slots nommés restent séparés.
+func TestSlotConstantsDistinctAndInRange(t *testing.T) {
+	named := map[string]int{
+		"SlotStreams": SlotStreams,
+		"SlotExt":     SlotExt,
+		"SlotStdlib":  SlotStdlib,
+		"SlotMySQLi":  SlotMySQLi,
+		"SlotPDO":     SlotPDO,
+		"SlotVM":      SlotVM,
+	}
+	owner := map[int]string{}
+	for name, id := range named {
+		if id < 0 || id >= MaxSlots {
+			t.Fatalf("%s = %d hors de [0, %d)", name, id, MaxSlots)
+		}
+		if prev, dup := owner[id]; dup {
+			t.Fatalf("%s et %s partagent le slot %d", name, prev, id)
+		}
+		owner[id] = name
+	}
+	z := New(1 << 12)
+	for name, id := range named {
+		z.SetSlot(id, name)
+	}
+	for name, id := range named {
+		if got := z.Slot(id); got != name {
+			t.Fatalf("Slot(%s) = %v", name, got)
+		}
+	}
+	z.Reset(func(CleanupItem) {})
+	for name, id := range named {
+		if z.Slot(id) != nil {
+			t.Fatalf("Slot(%s) non vidé par Reset", name)
+		}
+	}
+}
+
+func TestZoneCwdAndUmaskReset(t *testing.T) {
+	z := New(256)
+	if z.Umask() != DefaultUmask {
+		t.Fatalf("Umask initial = %#o, attendu %#o", z.Umask(), DefaultUmask)
+	}
+	if old := z.SetUmask(0o077); old != DefaultUmask {
+		t.Fatalf("ancien Umask = %#o, attendu %#o", old, DefaultUmask)
+	}
+	if z.Umask() != 0o077 || z.CreateMode(0o666) != 0o600 {
+		t.Fatalf("Umask=%#o CreateMode=%#o, attendu 077 et 0600", z.Umask(), z.CreateMode(0o666))
+	}
+	z.SetCwd("/tmp/zone_test_dir")
+	if got := z.ResolvePath("rel/file.txt"); got != "/tmp/zone_test_dir/rel/file.txt" {
+		t.Fatalf("ResolvePath relatif = %q", got)
+	}
+	if got := z.ResolvePath("/abs/file.txt"); got != "/abs/file.txt" {
+		t.Fatalf("ResolvePath absolu = %q", got)
+	}
+	z.Reset(nil)
+	if z.Umask() != DefaultUmask || z.CreateMode(0o666) != 0o644 {
+		t.Fatalf("après Reset: Umask=%#o CreateMode=%#o", z.Umask(), z.CreateMode(0o666))
+	}
+	if z.Cwd() == "/tmp/zone_test_dir" {
+		t.Fatalf("Cwd non réinitialisé après Reset: %q", z.Cwd())
+	}
+}
+

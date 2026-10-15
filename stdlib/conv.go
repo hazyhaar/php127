@@ -14,6 +14,24 @@ func itoa(n int) string { return strconv.Itoa(n) }
 
 func deref(z *zone.Zone, v types.Value) types.Value { return types.Deref(z, v) }
 
+func opaqueResourceClass(v types.Value) (string, bool) {
+	if v.Type != types.TypeResource {
+		return "", false
+	}
+	switch v.Extra {
+	case 0x4503:
+		return "GdImage", true
+	case 0x4504:
+		return "finfo", true
+	case 0x4505:
+		return "CurlHandle", true
+	case 0x4506:
+		return "XMLParser", true
+	default:
+		return "", false
+	}
+}
+
 func typeKind(z *zone.Zone, v types.Value) string {
 	v = deref(z, v)
 	switch v.Type {
@@ -35,6 +53,11 @@ func typeKind(z *zone.Zone, v types.Value) string {
 			return "object"
 		}
 		return name
+	case types.TypeResource:
+		if name, ok := opaqueResourceClass(v); ok {
+			return name
+		}
+		return "resource"
 	default:
 		return "unknown"
 	}

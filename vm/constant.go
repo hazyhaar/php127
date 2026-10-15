@@ -6,6 +6,9 @@ import (
 )
 
 func (vm *VM) constantValue(c *bytecode.Constant) types.Value {
+	if c.Thunk != nil {
+		return vm.evalConstThunk(c)
+	}
 	if c.IsString {
 		v, err := types.NewStringLiteral(vm.Zone, c.Text)
 		if err != nil {
@@ -51,4 +54,25 @@ func (vm *VM) propDefault(p bytecode.PropInfo) types.Value {
 		return types.NewUndef()
 	}
 	return types.NewNull()
+}
+
+// evalConstThunk exécute l'expression constante différée c dans la portée de sa classe déclarante ; une
+// exception levée pendant l'évaluation est propagée au cadre appelant et la valeur rendue est null.
+func (vm *VM) evalConstThunk(c *bytecode.Constant) types.Value {
+	scope := uint32(0)
+	if c.ThunkScope != "" {
+		if id, ok := vm.resolveName(c.ThunkScope); ok {
+			scope = id
+		}
+	}
+	control := vm.control
+	v, threw := vm.invokeOpArray(c.Thunk, types.Value{}, false, nil, scope, scope, vm.line)
+	if !threw && !vm.stop {
+		vm.control = control
+	}
+	if threw {
+		vmRelease(vm.Zone, &v)
+		return types.NewNull()
+	}
+	return v
 }

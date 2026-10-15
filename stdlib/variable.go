@@ -260,7 +260,11 @@ func nativeGettype(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, 
 	case types.TypeObject:
 		name = "object"
 	case types.TypeResource:
-		name = "resource"
+		if _, ok := opaqueResourceClass(v); ok {
+			name = "object"
+		} else {
+			name = "resource"
+		}
 	default:
 		name = "unknown type"
 	}
@@ -292,7 +296,11 @@ func nativeGetDebugType(z *zone.Zone, _ io.Writer, args []types.Value) (types.Va
 			name = "object"
 		}
 	case types.TypeResource:
-		name = "resource"
+		if cls, ok := opaqueResourceClass(v); ok {
+			name = cls
+		} else {
+			name = "resource"
+		}
 	default:
 		name = "unknown"
 	}
@@ -350,7 +358,12 @@ func nativeIsObject(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value,
 	if err := arity("is_object", len(args), 1, 1); err != nil {
 		return types.Value{}, err
 	}
-	return types.NewBool(deref(z, args[0]).Type == types.TypeObject), nil
+	v := deref(z, args[0])
+	if v.Type == types.TypeObject {
+		return types.NewBool(true), nil
+	}
+	_, ok := opaqueResourceClass(v)
+	return types.NewBool(ok), nil
 }
 
 func nativeIsScalar(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {

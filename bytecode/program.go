@@ -30,6 +30,9 @@ const (
 	ClassAbstract uint16 = 1 << iota
 	ClassFinal
 	ClassReadonly
+	// ClassAnonymous marque la classe d'une expression new class : déclarée par le fichier qui la contient, sous
+	// le nom interne de PHP, elle n'est jamais un nom seulement référencé.
+	ClassAnonymous
 )
 
 type AttributeArg struct {
@@ -250,12 +253,26 @@ type ClassConst struct {
 }
 
 // Constant ne contient aucun handle de zone de requete.
+// ConstantThunkName nomme l'OpArray d'une expression constante différée (Constant.Thunk).
+const ConstantThunkName = "{constant}"
+
+// AnonymousFunc indique qu'un OpArray de Program.Funcs n'a pas de nom PHP : fermeture ou expression
+// constante différée. Ces fonctions ne s'enregistrent jamais dans la table des noms de fonctions.
+func AnonymousFunc(name string) bool {
+	return name == "{closure}" || name == ConstantThunkName
+}
+
 type Constant struct {
 	Value    types.Value
 	Text     string
 	IsString bool
 	IsArray  bool
 	Items    []ConstantItem
+	// Thunk évalue à l'exécution une expression constante que la compilation ne peut pas résoudre :
+	// constante globale, constante d'une classe déclarée dans un autre fichier, new dans un initialiseur.
+	// ThunkScope nomme la classe déclarante, portée de self:: et parent:: pendant l'évaluation.
+	Thunk      *OpArray
+	ThunkScope string
 }
 
 type ConstantItem struct {
@@ -475,6 +492,24 @@ func BuiltinClassID(name string) (uint32, bool) {
 		return ClassJsonSerializable, true
 	case "stringable":
 		return ClassStringable, true
+	case "mysqli":
+		return ClassMysqli, true
+	case "mysqli_result":
+		return ClassMysqliResult, true
+	case "mysqli_stmt":
+		return ClassMysqliStmt, true
+	case "mysqli_driver":
+		return ClassMysqliDriver, true
+	case "mysqli_sql_exception":
+		return ClassMysqliSqlException, true
+	case "gdimage":
+		return ClassGdImage, true
+	case "finfo":
+		return ClassFinfo, true
+	case "curlhandle":
+		return ClassCurlHandle, true
+	case "xmlparser":
+		return ClassXMLParser, true
 	default:
 		return 0, false
 	}
@@ -640,6 +675,24 @@ func BuiltinClassName(id uint32) (string, bool) {
 		return "ReflectionType", true
 	case ClassReflectionFunctionAbstract:
 		return "ReflectionFunctionAbstract", true
+	case ClassMysqli:
+		return "mysqli", true
+	case ClassMysqliResult:
+		return "mysqli_result", true
+	case ClassMysqliStmt:
+		return "mysqli_stmt", true
+	case ClassMysqliDriver:
+		return "mysqli_driver", true
+	case ClassMysqliSqlException:
+		return "mysqli_sql_exception", true
+	case ClassGdImage:
+		return "GdImage", true
+	case ClassFinfo:
+		return "finfo", true
+	case ClassCurlHandle:
+		return "CurlHandle", true
+	case ClassXMLParser:
+		return "XMLParser", true
 	default:
 		return "", false
 	}
@@ -709,9 +762,6 @@ func Link(p *Program) error {
 		if err := flattenTraits(p, c); err != nil {
 			return err
 		}
-		if err := checkInterfaces(p, c); err != nil {
-			return err
-		}
 		for _, m := range c.Methods {
 			if m.Func != nil {
 				m.Func.FuncID = nextFuncID
@@ -758,7 +808,7 @@ func isBuiltinExceptionOrError(id uint32) bool {
 		ClassDateError, ClassDateObjectError, ClassDateRangeError, ClassDateException,
 		ClassDateInvalidTimeZoneException, ClassDateInvalidOperationException,
 		ClassDateMalformedStringException, ClassDateMalformedIntervalStringException,
-		ClassReflectionException:
+		ClassReflectionException, ClassMysqliSqlException:
 		return true
 	default:
 		return false
@@ -888,55 +938,3 @@ func propLocal(c *ClassProto, name string) (PropInfo, bool) {
 	}
 	return PropInfo{}, false
 }
-
-func checkInterfaces(p *Program, c *ClassProto) error {
-	if c.Kind != KindClass || c.Flags&ClassAbstract != 0 {
-		return nil
-	}
-	for _, name := range c.Interfaces {
-		iface := p.classByName(name)
-		if iface == nil || iface.Kind != KindInterface {
-			continue
-		}
-		for _, m := range iface.Methods {
-			if _, ok := methodOn(p, c, m.Name); !ok {
-				return &VerifyError{PC: -1, Msg: "méthode d'interface absente: " + c.Name + "::" + m.Name}
-			}
-		}
-	}
-	return nil
-}
-
-func methodOn(p *Program, c *ClassProto, name string) (MethodProto, bool) {
-	for c != nil {
-		if m, ok := methodLocal(c, name); ok {
-			return m, true
-		}
-		if len(c.Traits) > 0 {
-			for _, tname := range c.Traits {
-				if p.classByName(tname) == nil {
-					return MethodProto{}, true
-				}
-			}
-		}
-		if c.ParentID == ClassNone {
-			return MethodProto{}, false
-		}
-		if _, ok := BuiltinClassID(c.ParentName); ok || c.ParentID < ClassUser {
-			return MethodProto{}, true
-		}
-		parent := (*ClassProto)(nil)
-		for _, cand := range p.Classes {
-			if cand != nil && cand.ID == c.ParentID {
-				parent = cand
-				break
-			}
-		}
-		if parent != nil && len(parent.Methods) == 0 && len(parent.Props) == 0 && parent.ParentName == "" {
-			return MethodProto{}, true
-		}
-		c = parent
-	}
-	return MethodProto{}, false
-}
-

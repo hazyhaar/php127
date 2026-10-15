@@ -2,14 +2,9 @@
 package stdlib
 
 import (
-	"bytes"
-	"compress/gzip"
-	"compress/zlib"
-	"crypto/aes"
-	"crypto/cipher"
 	crand "crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -764,45 +759,6 @@ func nativeUniqid(z *zone.Zone, out io.Writer, args []types.Value) (types.Value,
 	return newStr(z, s)
 }
 
-func nativeIniGet(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("ini_get", len(args), 1, 1); err != nil {
-		return types.Value{}, err
-	}
-	opt, err := asStringParam(z, args[0], "ini_get", "1", "option")
-	if err != nil {
-		return types.Value{}, err
-	}
-	switch opt {
-	case "memory_limit":
-		return newStr(z, "128M")
-	case "max_execution_time":
-		return newStr(z, "0")
-	case "display_errors":
-		return newStr(z, "1")
-	case "error_reporting":
-		return newStr(z, "32767")
-	case "default_charset":
-		return newStr(z, "UTF-8")
-	case "date.timezone":
-		return newStr(z, "UTC")
-	default:
-		return newStr(z, "")
-	}
-}
-
-func nativeIniSet(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("ini_set", len(args), 2, 2); err != nil {
-		return types.Value{}, err
-	}
-	if _, err := asStringParam(z, args[0], "ini_set", "1", "option"); err != nil {
-		return types.Value{}, err
-	}
-	if _, err := asStringParam(z, args[1], "ini_set", "2", "value"); err != nil {
-		return types.Value{}, err
-	}
-	return newStr(z, "")
-}
-
 func nativeErrorLog(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
 	if err := arity("error_log", len(args), 1, 4); err != nil {
 		return types.Value{}, err
@@ -866,17 +822,46 @@ func nativePhpUname(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value,
 	}
 }
 
-func hashPasswordWithSalt(password, salt string) string {
-	sum := sha256.Sum256([]byte(salt + ":" + password))
-	b64 := base64.RawStdEncoding.EncodeToString(sum[:])
-	// Remplacement compatible bcrypt 22 chars + 31 chars = 53 chars après $2y$10$
-	combined := salt + b64
-	for len(combined) < 53 {
-		combined += b64
+// bcryptDefaultCost est le coût de PASSWORD_BCRYPT en l'absence d'option « cost ».
+const bcryptDefaultCost = 10
+
+// passwordAlgoIsBcrypt suit php_password_algo_find_zval de PHP 8.3 sur le paramètre string|int|null $algo :
+// null, 0, 1 et « 2y » désignent bcrypt ; tout autre algorithme est refusé, Argon2 n'étant pas disponible.
+func passwordAlgoIsBcrypt(z *zone.Zone, v types.Value) (bool, error) {
+	v = deref(z, v)
+	switch v.Type {
+	case types.TypeNull, types.TypeUndef:
+		return true, nil
+	case types.TypeString:
+		return types.StringData(z, v) == "2y", nil
+	case types.TypeLong, types.TypeTrue, types.TypeFalse:
+		n, _ := asIntLoose(z, v)
+		return n == 0 || n == 1, nil
+	case types.TypeDouble:
+		f := v.ToDouble()
+		return f == 0 || f == 1, nil
+	default:
+		return false, typeErr("password_hash", "2", "algo", "string|int|null", typeKind(z, v))
 	}
-	return "$2y$10$" + combined[:53]
 }
 
+// passwordCost lit l'option « cost » du tableau $options par conversion entière lâche (zval_get_long) ;
+// bcryptDefaultCost en son absence.
+func passwordCost(z *zone.Zone, opts types.Value) (int64, error) {
+	cost := int64(bcryptDefaultCost)
+	var err error
+	types.ArrayForEach(z, opts, func(k, v types.Value) bool {
+		if k.Type != types.TypeString || types.StringData(z, k) != "cost" {
+			return true
+		}
+		cost, err = asIntLoose(z, v)
+		return false
+	})
+	return cost, err
+}
+
+// nativePasswordHash produit un condensat bcrypt « $2y$<coût>$ » de 60 caractères sur un sel de 16 octets
+// tirés de crypto/rand, comme password_hash de PHP 8.3 avec PASSWORD_BCRYPT.
 func nativePasswordHash(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
 	if err := arity("password_hash", len(args), 2, 3); err != nil {
 		return types.Value{}, err
@@ -885,10 +870,33 @@ func nativePasswordHash(z *zone.Zone, _ io.Writer, args []types.Value) (types.Va
 	if err != nil {
 		return types.Value{}, err
 	}
-	var saltBytes [16]byte
-	_, _ = crand.Read(saltBytes[:])
-	salt := base64.RawStdEncoding.EncodeToString(saltBytes[:])[:22]
-	return newStr(z, hashPasswordWithSalt(pw, salt))
+	ok, err := passwordAlgoIsBcrypt(z, args[1])
+	if err != nil {
+		return types.Value{}, err
+	}
+	if !ok {
+		return types.Value{}, valErr("password_hash", "2", "algo", "must be a valid password hashing algorithm")
+	}
+	cost := int64(bcryptDefaultCost)
+	if len(args) == 3 {
+		opts, err := asArray(z, args[2], "password_hash", "3", "options")
+		if err != nil {
+			return types.Value{}, err
+		}
+		if cost, err = passwordCost(z, opts); err != nil {
+			return types.Value{}, err
+		}
+	}
+	if cost < bcryptMinCost || cost > bcryptMaxCost {
+		return types.Value{}, ValueError{"Invalid bcrypt cost parameter specified: " + strconv.FormatInt(cost, 10)}
+	}
+	if strings.IndexByte(pw, 0) >= 0 {
+		return types.Value{}, ValueError{"Bcrypt password must not contain null character"}
+	}
+	var salt [16]byte
+	_, _ = crand.Read(salt[:])
+	h, _ := bcryptHash([]byte(pw), 'y', int(cost), &salt)
+	return newStr(z, h)
 }
 
 func nativePasswordVerify(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
@@ -903,11 +911,149 @@ func nativePasswordVerify(z *zone.Zone, _ io.Writer, args []types.Value) (types.
 	if err != nil {
 		return types.Value{}, err
 	}
-	if strings.HasPrefix(h, "$2y$10$") && len(h) == 60 {
-		salt := h[7:29]
-		return types.NewBool(hashPasswordWithSalt(pw, salt) == h), nil
+	if !isBcryptSetting(h) {
+		return types.NewBool(false), nil
 	}
-	return types.NewBool(false), nil
+	// Comme php_password_bcrypt_verify : crypt(password, hash) puis comparaison à durée constante.
+	got, ok := bcryptCrypt([]byte(pw), h)
+	return types.NewBool(ok && subtle.ConstantTimeCompare([]byte(got), []byte(h)) == 1), nil
+}
+
+// nativePasswordGetInfo analyse l'en-tête d'un condensat comme password_get_info de PHP 8.3 :
+// « $2y$<coût>$ » de 60 octets rend algo="2y", algoName="bcrypt", options=["cost" => coût] ;
+// « $argon2i$ » et « $argon2id$ » rendent memory_cost, time_cost et threads ; tout autre condensat
+// rend algo=null, algoName="unknown", options=[].
+func nativePasswordGetInfo(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("password_get_info", len(args), 1, 1); err != nil {
+		return types.Value{}, err
+	}
+	h, err := asStringParam(z, args[0], "password_get_info", "1", "hash")
+	if err != nil {
+		return types.Value{}, err
+	}
+	out, err := types.NewArray(z)
+	if err != nil {
+		return types.Value{}, err
+	}
+	opts, err := types.NewArray(z)
+	if err != nil {
+		return types.Value{}, err
+	}
+	setKV := func(arr *types.Value, k string, v types.Value) error {
+		kv, err := newStr(z, k)
+		if err != nil {
+			return err
+		}
+		err = types.ArraySet(z, arr, kv, v, nil)
+		types.ReleaseValue(z, &kv)
+		return err
+	}
+	algoVal := types.NewNull()
+	algoName := "unknown"
+	if len(h) == 60 && strings.HasPrefix(h, "$2y$") {
+		cost := int64(bcryptDefaultCost)
+		if c, ok := parseLeadingLong(h[4:]); ok {
+			cost = c
+		}
+		algoVal, err = newStr(z, "2y")
+		if err != nil {
+			return types.Value{}, err
+		}
+		algoName = "bcrypt"
+		if err := setKV(&opts, "cost", types.NewLong(cost)); err != nil {
+			return types.Value{}, err
+		}
+	} else if strings.HasPrefix(h, "$argon2id$") || strings.HasPrefix(h, "$argon2i$") {
+		id := "argon2i"
+		if strings.HasPrefix(h, "$argon2id$") {
+			id = "argon2id"
+		}
+		algoVal, err = newStr(z, id)
+		if err != nil {
+			return types.Value{}, err
+		}
+		algoName = id
+		mem, tim, thr := parseArgon2Info(h)
+		if err := setKV(&opts, "memory_cost", types.NewLong(mem)); err != nil {
+			return types.Value{}, err
+		}
+		if err := setKV(&opts, "time_cost", types.NewLong(tim)); err != nil {
+			return types.Value{}, err
+		}
+		if err := setKV(&opts, "threads", types.NewLong(thr)); err != nil {
+			return types.Value{}, err
+		}
+	}
+	nameVal, err := newStr(z, algoName)
+	if err != nil {
+		return types.Value{}, err
+	}
+	if err := setKV(&out, "algo", algoVal); err != nil {
+		return types.Value{}, err
+	}
+	if algoVal.Type == types.TypeString {
+		types.ReleaseValue(z, &algoVal)
+	}
+	if err := setKV(&out, "algoName", nameVal); err != nil {
+		return types.Value{}, err
+	}
+	types.ReleaseValue(z, &nameVal)
+	if err := setKV(&out, "options", opts); err != nil {
+		return types.Value{}, err
+	}
+	types.ReleaseValue(z, &opts)
+	return out, nil
+}
+
+func parseLeadingLong(s string) (int64, bool) {
+	i := 0
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		i++
+	}
+	j := i
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	if j == i {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s[:j], 10, 64)
+	return n, err == nil
+}
+
+func parseArgon2Info(hash string) (mem, tim, thr int64) {
+	ver, mem, tim, thr := int64(19), int64(65536), int64(4), int64(1)
+	p, ok := strings.CutPrefix(hash, "$argon2id$")
+	if !ok {
+		if p, ok = strings.CutPrefix(hash, "$argon2i$"); !ok {
+			return
+		}
+	}
+	fields := []*int64{&ver, &mem, &tim, &thr}
+	prefixes := []string{"v=", "$m=", ",t=", ",p="}
+	if !strings.HasPrefix(p, "v=") {
+		fields, prefixes = fields[1:], prefixes[1:]
+	}
+	for i, pre := range prefixes {
+		rest, ok := strings.CutPrefix(p, pre)
+		if !ok {
+			return
+		}
+		n, ok := parseLeadingLong(rest)
+		if !ok {
+			return
+		}
+		*fields[i] = n
+		k := 0
+		if rest != "" && (rest[0] == '-' || rest[0] == '+') {
+			k++
+		}
+		for k < len(rest) && rest[k] >= '0' && rest[k] <= '9' {
+			k++
+		}
+		p = rest[k:]
+	}
+	return
 }
 
 func nativeCrypt(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
@@ -922,90 +1068,16 @@ func nativeCrypt(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, er
 	if err != nil {
 		return types.Value{}, err
 	}
+	if isBcryptSetting(salt) {
+		// Un réglage refusé par crypt_blowfish rend « *0 », le sel ne pouvant commencer par « *0 ».
+		h, ok := bcryptCrypt([]byte(str), salt)
+		if !ok {
+			h = "*0"
+		}
+		return newStr(z, h)
+	}
 	sum := sha256.Sum256([]byte(salt + ":" + str))
 	return newStr(z, salt+hex.EncodeToString(sum[:8]))
-}
-
-func nativeOpensslEncrypt(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("openssl_encrypt", len(args), 3, 8); err != nil {
-		return types.Value{}, err
-	}
-	data, err := asStringParam(z, args[0], "openssl_encrypt", "1", "data")
-	if err != nil {
-		return types.Value{}, err
-	}
-	_, err = asStringParam(z, args[1], "openssl_encrypt", "2", "cipher_algo")
-	if err != nil {
-		return types.Value{}, err
-	}
-	passphrase, err := asStringParam(z, args[2], "openssl_encrypt", "3", "passphrase")
-	if err != nil {
-		return types.Value{}, err
-	}
-	options := int64(0)
-	if len(args) >= 4 {
-		options, err = asIntParam(z, args[3], "openssl_encrypt", "4", "options")
-		if err != nil {
-			return types.Value{}, err
-		}
-	}
-	iv := ""
-	if len(args) >= 5 {
-		iv, err = asStringParam(z, args[4], "openssl_encrypt", "5", "iv")
-		if err != nil {
-			return types.Value{}, err
-		}
-	}
-	keyHash := sha256.Sum256([]byte(passphrase))
-	block, err := aes.NewCipher(keyHash[:])
-	if err != nil {
-		return types.NewBool(false), nil
-	}
-	var ivBuf [16]byte
-	copy(ivBuf[:], iv)
-	padLen := 16 - (len(data) % 16)
-	padded := make([]byte, len(data)+padLen)
-	copy(padded, data)
-	for i := len(data); i < len(padded); i++ {
-		padded[i] = byte(padLen)
-	}
-	out := make([]byte, len(padded))
-	mode := cipher.NewCBCEncrypter(block, ivBuf[:])
-	mode.CryptBlocks(out, padded)
-	if options&1 != 0 { // OPENSSL_RAW_DATA
-		return newBytes(z, out)
-	}
-	return newStr(z, base64.StdEncoding.EncodeToString(out))
-}
-
-func nativeGzcompress(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("gzcompress", len(args), 1, 3); err != nil {
-		return types.Value{}, err
-	}
-	data, err := asStringParam(z, args[0], "gzcompress", "1", "data")
-	if err != nil {
-		return types.Value{}, err
-	}
-	var buf bytes.Buffer
-	w := zlib.NewWriter(&buf)
-	_, _ = w.Write([]byte(data))
-	_ = w.Close()
-	return newBytes(z, buf.Bytes())
-}
-
-func nativeGzencode(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
-	if err := arity("gzencode", len(args), 1, 3); err != nil {
-		return types.Value{}, err
-	}
-	data, err := asStringParam(z, args[0], "gzencode", "1", "data")
-	if err != nil {
-		return types.Value{}, err
-	}
-	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
-	_, _ = w.Write([]byte(data))
-	_ = w.Close()
-	return newBytes(z, buf.Bytes())
 }
 
 func nativeUsleep(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
@@ -1042,4 +1114,3 @@ func nativeFlush(_ *zone.Zone, _ io.Writer, args []types.Value) (types.Value, er
 	}
 	return types.NewNull(), nil
 }
-

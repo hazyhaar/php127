@@ -27,4 +27,5 @@ jobs:
       - name: Build Standalone CLI & Verify Suites
         run: |
           go build -o /tmp/php127 ./cmd/php127
-          LC_ALL=C LANG=C go test -race -count=1 ./zone/... ./types/... ./lexer/... ./parser/... ./ast/... ./bytecode/... ./compiler/... ./stdlib/... ./vm/... ./sapi/... ./ext/... ./fiber/... ./filter/... ./datetime/... ./pdo/... ./reflection/... ./session/... ./spl/... ./streams/... ./cmd/...
+          LC_ALL=C LANG=C go test -race -count=1 ./zone/... ./types/... ./lexer/... ./parser/... ./ast/... ./bytecode/... ./compiler/... ./stdlib/... ./vm/... ./sapi/... ./ext/... ./mysqli/... ./fiber/... ./filter/... ./datetime/... ./pdo/... ./reflection/... ./session/... ./spl/... ./streams/... ./cmd/...
+

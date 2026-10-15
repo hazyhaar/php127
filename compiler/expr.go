@@ -17,7 +17,10 @@ func (e *emitter) expr(expr ast.Expr) {
 		return
 	}
 	line := e.line
-	e.line = uint32(expr.Location().Line)
+	// Un nœud sans position (motif de déstructuration notamment) hérite de la ligne de l'expression englobante.
+	if l := expr.Location().Line; l > 0 {
+		e.line = uint32(l)
+	}
 	defer func() { e.line = line }()
 	switch x := expr.(type) {
 	case *ast.MagicConstExpr:
@@ -82,8 +85,8 @@ func (e *emitter) expr(expr ast.Expr) {
 		switch x.Op {
 		case "instanceof":
 			e.expr(x.Left)
-			id, _ := e.classOperand(x.Right)
-			e.emit(bc.OpInstanceof, id, 0, 0)
+			id, flags := e.classOperand(x.Right)
+			e.emit(bc.OpInstanceof, id, 0, flags)
 		case "&&", "and", "||", "or":
 			e.expr(x.Left)
 			op := bc.OpJmpZ
@@ -128,7 +131,9 @@ func (e *emitter) expr(expr ast.Expr) {
 		}
 	case *ast.UnaryExpr:
 		if x.Op == "@" {
+			e.emit(bc.OpNop, 0, 0, bc.FlagSilenceBegin)
 			e.expr(x.Expr)
+			e.emit(bc.OpNop, 0, 0, bc.FlagSilenceEnd)
 			break
 		}
 		if x.Op == "(unset)" {
@@ -218,7 +223,7 @@ func (e *emitter) expr(expr ast.Expr) {
 		if x.Op == "??=" {
 			if isSimpleForeachVar(x.Left) {
 				idx := e.variable(x.Left)
-				e.emit(bc.OpLoadCV, idx, 0, 0)
+				e.emit(bc.OpLoadCV, idx, 0, bc.FlagIsset)
 				p := e.emit(bc.OpJmpNull, 0, 0, 0)
 				end := e.emit(bc.OpJmp, 0, 0, 0)
 				e.patch(p)
@@ -227,7 +232,8 @@ func (e *emitter) expr(expr ast.Expr) {
 				e.patch(end)
 			} else {
 				left, temps := e.stableTarget(x.Left)
-				e.expr(left)
+				// La lecture de la cible suit celle de ?? : clé ou propriété absente sans diagnostic.
+				e.exprCoalesce(left)
 				p := e.emit(bc.OpJmpNull, 0, 0, 0)
 				end := e.emit(bc.OpJmp, 0, 0, 0)
 				e.patch(p)
@@ -307,12 +313,23 @@ func (e *emitter) expr(expr ast.Expr) {
 				continue
 			}
 			op := bc.OpAppendArrayElement
+			if item.Unpack {
+				e.expr(item.Value)
+				e.emit(op, 0, 0, bc.FlagUnpack)
+				continue
+			}
 			if item.Key != nil {
 				e.expr(item.Key)
 				op = bc.OpAddArrayElement
 			}
-			e.expr(item.Value)
-			e.emit(op, 0, 0, 0)
+			flags := uint16(0)
+			if item.ByRef && e.exprRef(item.Value) {
+				// [&$x] range dans le tableau la référence elle-même.
+				flags = bc.FlagLoadRef
+			} else {
+				e.expr(item.Value)
+			}
+			e.emit(op, 0, 0, flags)
 		}
 	case *ast.DimFetchExpr:
 		if x.Dim == nil {
@@ -365,7 +382,12 @@ func (e *emitter) expr(expr ast.Expr) {
 			idx, ok := e.funcs[strings.ToLower(name.Name)]
 			if !ok {
 				e.emit(bc.OpInitCall, e.str(name.Name), 0, bc.FlagNative)
-				e.args(x.Args, nativeParams(name.Name))
+				params := bc.NativeFunctionParams(name.Name)
+				if params == nil && NativeByValue != nil && NativeByValue(name.Name) {
+					// Fonction native sans paramètre par référence : arguments par valeur, sans décision à l'exécution.
+					params = []bc.ParamInfo{}
+				}
+				e.args(x.Args, params)
 				e.emit(bc.OpDoCall, 0, 0, 0)
 				break
 			}
@@ -389,7 +411,11 @@ func (e *emitter) expr(expr ast.Expr) {
 		e.emit(bc.OpDoCall, 0, 0, 0)
 	case *ast.NewExpr:
 		if x.Anonymous != nil {
-			e.emit(bc.OpInitNew, bc.ClassStdClass, 0, 0)
+			anon := e.anonClasses[x.Anonymous]
+			if anon == nil {
+				e.fail("classe anonyme non déclarée")
+			}
+			e.emit(bc.OpInitNew, anon.ID, 0, 0)
 			e.args(x.Args, nil)
 			e.emit(bc.OpDoCall, 0, 0, 0)
 			break
@@ -406,7 +432,8 @@ func (e *emitter) expr(expr ast.Expr) {
 		mname := e.memberName(x.Method)
 		e.expr(x.Object)
 		e.emit(bc.OpInitMethodCall, e.str(mname), 0, 0)
-		e.args(x.Args, nativeMethodParams(mname))
+		methodParams, _ := bc.NativeMethodParams(mname)
+		e.args(x.Args, methodParams)
 		e.emit(bc.OpDoCall, 0, 0, 0)
 	case *ast.StaticCallExpr:
 		if x.FirstClass {
@@ -423,8 +450,8 @@ func (e *emitter) expr(expr ast.Expr) {
 	case *ast.ClassConstFetchExpr:
 		id, flags := e.classOperand(x.Class)
 		name := e.name(x.Const)
-		if name == "class" && flags == 0 {
-			e.text(strings.TrimPrefix(e.name(x.Class), `\`))
+		if strings.EqualFold(name, "class") && flags == 0 {
+			e.text(e.className(x.Class))
 		} else {
 			e.emit(bc.OpFetchClassConst, e.str(name), id, flags)
 		}
@@ -552,44 +579,6 @@ func (e *emitter) exprCoalesce(expr ast.Expr) {
 	e.expr(expr)
 }
 
-func nativeParams(name string) []bc.ParamInfo {
-	switch strings.ToLower(strings.TrimPrefix(name, `\`)) {
-	case "preg_match", "preg_match_all":
-		return []bc.ParamInfo{{Name: "pattern"}, {Name: "subject"}, {Name: "matches", ByRef: true}, {Name: "flags"}, {Name: "offset"}}
-	case "preg_replace", "preg_replace_callback":
-		return []bc.ParamInfo{{Name: "pattern"}, {Name: "replacement"}, {Name: "subject"}, {Name: "limit"}, {Name: "count", ByRef: true}}
-	case "str_replace", "str_ireplace":
-		return []bc.ParamInfo{{Name: "search"}, {Name: "replace"}, {Name: "subject"}, {Name: "count", ByRef: true}}
-	case "parse_str":
-		return []bc.ParamInfo{{Name: "string"}, {Name: "result", ByRef: true}}
-	case "headers_sent":
-		return []bc.ParamInfo{{Name: "filename", ByRef: true}, {Name: "line", ByRef: true}}
-	case "natsort", "natcasesort", "shuffle":
-		return []bc.ParamInfo{{Name: "array", ByRef: true}, {Name: "flags"}}
-	case "settype":
-		return []bc.ParamInfo{{Name: "var", ByRef: true}, {Name: "type"}}
-	case "usort", "uasort", "uksort", "array_walk", "array_walk_recursive":
-		return []bc.ParamInfo{{Name: "array", ByRef: true}, {Name: "callback"}, {Name: "arg"}}
-	case "array_multisort":
-		return []bc.ParamInfo{{Name: "array", ByRef: true}, {Name: "rest", ByRef: true, Variadic: true}}
-	case "similar_text":
-		return []bc.ParamInfo{{Name: "string1"}, {Name: "string2"}, {Name: "percent", ByRef: true}}
-	case "sscanf":
-		return []bc.ParamInfo{{Name: "string"}, {Name: "format"}, {Name: "vars", ByRef: true, Variadic: true}}
-	case "exec":
-		return []bc.ParamInfo{{Name: "command"}, {Name: "output", ByRef: true}, {Name: "result_code", ByRef: true}}
-	default:
-		return nil
-	}
-}
-
-func nativeMethodParams(name string) []bc.ParamInfo {
-	if strings.EqualFold(name, "bindParam") {
-		return []bc.ParamInfo{{Name: "param"}, {Name: "var", ByRef: true}, {Name: "type"}, {Name: "maxLength"}, {Name: "driverOptions"}}
-	}
-	return nil
-}
-
 func (e *emitter) args(args []ast.Arg, params []bc.ParamInfo) {
 	for i, arg := range args {
 		if arg.Name != "" {
@@ -611,28 +600,84 @@ func (e *emitter) args(args []ast.Arg, params []bc.ParamInfo) {
 		} else if len(params) > 0 && params[len(params)-1].Variadic {
 			byRef = params[len(params)-1].ByRef
 		}
-		if d, ok := arg.Value.(*ast.DimFetchExpr); ok && d.Dim == nil {
-			e.assign(d, &ast.ConstFetchExpr{Name: "null"})
+		sendFlags := uint16(0)
+		if params == nil && !arg.Unpack && arg.Name == "" && e.exprFuncArg(arg.Value) {
+			sendFlags = bc.FlagFuncArg
 		} else if byRef {
 			if e.exprRef(arg.Value) {
 				op = bc.OpSendRef
 			} else {
 				e.expr(arg.Value)
 			}
+		} else if d, ok := arg.Value.(*ast.DimFetchExpr); ok && d.Dim == nil {
+			e.assign(d, &ast.ConstFetchExpr{Name: "null"})
 		} else {
 			e.expr(arg.Value)
 		}
 		if arg.Name != "" {
 			e.emit(bc.OpSendNamed, e.str(arg.Name), 0, 0)
 		} else {
-			e.emit(op, 0, 0, 0)
+			e.emit(op, 0, 0, sendFlags)
 		}
 	}
 }
 
+// exprFuncArg compile un argument désignant une variable, un élément ou une propriété d'un appel dont la
+// signature est inconnue à la compilation : chaque lecture porte FlagFuncArg et la VM choisit à l'exécution
+// la lecture par référence ou par valeur. Faux si l'expression ne désigne pas un emplacement.
+func (e *emitter) exprFuncArg(expr ast.Expr) bool {
+	line := e.line
+	if l := expr.Location().Line; l > 0 {
+		e.line = uint32(l)
+	}
+	defer func() { e.line = line }()
+	switch x := expr.(type) {
+	case *ast.VarExpr:
+		if x.Dynamic == nil && (x.Name == "this" || x.Name == "GLOBALS") {
+			return false
+		}
+		e.emit(bc.OpLoadCV, e.variable(x), 0, bc.FlagFuncArg)
+		return true
+	case *ast.DimFetchExpr:
+		if isGlobals(x.Var) {
+			return false
+		}
+		if x.Dim == nil {
+			if !e.exprRef(x.Var) {
+				return false
+			}
+			e.value(types.NewUndef())
+			e.emit(bc.OpFetchDimW, 0, 0, bc.FlagFuncArg)
+			return true
+		}
+		if !e.exprFuncArg(x.Var) {
+			e.expr(x.Var)
+		}
+		e.expr(x.Dim)
+		e.emit(bc.OpFetchDimR, 0, 0, bc.FlagFuncArg)
+		return true
+	case *ast.PropFetchExpr:
+		if x.Nullsafe {
+			return false
+		}
+		e.expr(x.Object)
+		e.emit(bc.OpFetchPropR, e.str(e.memberName(x.Property)), 0, bc.FlagFuncArg)
+		return true
+	}
+	return false
+}
+
+// NativeByValue, posé par le paquet vm, indique qu'un nom désigne une fonction native dont aucun paramètre
+// ne se transmet par référence. Nil, toute fonction absente du fichier compilé reçoit des arguments FlagFuncArg.
+var NativeByValue func(name string) bool
+
 func (e *emitter) exprRef(expr ast.Expr) bool {
 	switch x := expr.(type) {
 	case *ast.VarExpr:
+		if x.Name == "this" && x.Dynamic == nil {
+			// $this n'est pas une variable réaffectable : l'appelant en transmet la valeur.
+			return false
+		}
 		e.emit(bc.OpLoadCV, e.variable(x), 0, bc.FlagLoadRef)
 		return true
 	case *ast.DimFetchExpr:
@@ -644,10 +689,11 @@ func (e *emitter) exprRef(expr ast.Expr) bool {
 		}
 		if x.Dim != nil {
 			e.expr(x.Dim)
-			e.emit(bc.OpFetchDimW, 0, 0, 0)
-			return true
+		} else {
+			e.value(types.NewUndef())
 		}
-		return false
+		e.emit(bc.OpFetchDimW, 0, 0, 0)
+		return true
 	case *ast.PropFetchExpr:
 		e.expr(x.Object)
 		e.emit(bc.OpFetchPropW, e.str(e.memberName(x.Property)), 0, 0)
@@ -661,9 +707,9 @@ func (e *emitter) closure(params []ast.Param, uses []ast.ClosureUse, body []ast.
 }
 func (e *emitter) closureFull(params []ast.Param, uses []ast.ClosureUse, body []ast.Stmt, result ast.TypeRef, byRef bool, attrs []ast.Attribute) {
 	child := e.compilation.emitter("{closure}")
-	child.namespace = e.namespace
+	child.namespace, child.uses = e.namespace, e.uses
 	child.class = e.class
-	child.fn.ReturnType = typeName(result)
+	child.fn.ReturnType = child.typeName(result)
 	child.fn.ReturnByRef = byRef
 	child.fn.Attributes = e.attributes(attrs)
 	child.params(params)
@@ -810,7 +856,7 @@ func (e *emitter) assign(left, right ast.Expr) {
 			} else {
 				e.emit(bc.OpLoadCV, arrays[i], 0, 0)
 				e.emit(bc.OpLoadCV, keys[i], 0, 0)
-				e.emit(bc.OpFetchDimR, 0, 0, 0)
+				e.emit(bc.OpFetchDimR, 0, 0, bc.FlagDimWrite)
 			}
 		}
 	}

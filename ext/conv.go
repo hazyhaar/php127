@@ -26,6 +26,19 @@ func typeKind(z *zone.Zone, v types.Value) string {
 		return "array"
 	case types.TypeObject:
 		return "object"
+	case types.TypeResource:
+		switch v.Extra {
+		case ResourceKindGD:
+			return "GdImage"
+		case ResourceKindFinfo:
+			return "finfo"
+		case ResourceKindCurl:
+			return "CurlHandle"
+		case ResourceKindXML:
+			return "XMLParser"
+		default:
+			return "resource"
+		}
 	default:
 		return "unknown"
 	}
@@ -49,7 +62,9 @@ func setStrKey(z *zone.Zone, a *types.Value, key string, v types.Value) error {
 	if err != nil {
 		return err
 	}
-	return types.ArraySet(z, a, k, v, nil)
+	err = types.ArraySet(z, a, k, v, nil)
+	types.ReleaseValue(z, &k)
+	return err
 }
 
 func writeRef(z *zone.Zone, slot, v types.Value) {

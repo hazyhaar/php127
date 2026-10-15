@@ -23,7 +23,7 @@ func (vm *VM) callback(v types.Value) (callSpec, bool) {
 		} else {
 			spec.kind, spec.method, spec.flags = callFunc, name, bytecode.FlagNative
 			for i, fn := range vm.Program.Funcs {
-				if strings.EqualFold(fn.Name, name) {
+				if fn != nil && !bytecode.AnonymousFunc(fn.Name) && strings.EqualFold(fn.Name, name) {
 					spec.funcIndex, spec.flags = i, 0
 					return spec, true
 				}
@@ -160,10 +160,14 @@ func (vm *VM) invokeCallback(call callSpec, args []types.Value, line uint32) (ty
 			}
 			return ret, threw || vm.stop
 		}
+		if isPotentialIntrinsic(inv.method) {
+			return vm.invokeNativeNested(inv, line)
+		}
 		if native, ok := lookupNative(inv.method); ok {
 			dargs := make([]types.Value, len(inv.args))
 			for i, a := range inv.args {
-				if nativeArgIsRef(inv.method, i) && a.Type == types.TypeReference {
+				if bytecode.NativeArgIsRef(inv.method, i) && a.Type == types.TypeReference {
+					vm.separateRefArray(a)
 					dargs[i] = a
 				} else {
 					dargs[i] = types.Deref(vm.Zone, a)
@@ -200,4 +204,43 @@ func (vm *VM) invokeCallback(call callSpec, args []types.Value, line uint32) (ty
 		vm.releaseSpecObj(inv)
 		return types.NewNull(), true
 	}
+}
+
+// invokeNativeNested exécute depuis un rappel une fonction native que doNative seul sait servir (intrinsèque de la
+// VM ou d'extension, error_reporting). doNative opère comme une instruction d'appel : il empile son résultat et
+// avance le compteur ordinal du cadre courant. Un cadre relais sans code, au nom de la fonction et au fichier de
+// l'appelant, reçoit donc ce résultat et ce pas ; un cadre en ligne empilé par l'intrinsèque (call_user_func
+// d'une fonction utilisateur) s'exécute au-dessus de lui. Une exception remonte comme pour invokeOpArray.
+func (vm *VM) invokeNativeNested(inv callSpec, line uint32) (types.Value, bool) {
+	inv.icPC = -1
+	inv.flags |= bytecode.FlagNative
+	// Le nom peut venir de l'arène et finir dans une entrée de trace qui survit à l'instruction.
+	relay := &bytecode.OpArray{Name: strings.Clone(inv.method), MaxStack: 2, CVMetaResolved: true}
+	if len(vm.frames) > 0 && vm.frame().fn != nil {
+		relay.Filename = vm.frame().fn.Filename
+	}
+	if !vm.pushFrame(relay, 0, 0, types.Value{}, false, line) {
+		vm.releaseArgs(inv.args)
+		return types.NewUndef(), true
+	}
+	depth := len(vm.frames)
+	vm.doNative(inv, line)
+	if len(vm.frames) > depth && !vm.stop {
+		vm.execFrames(depth)
+	}
+	if vm.stop {
+		return types.NewUndef(), true
+	}
+	if len(vm.frames) == depth && !vm.hasThrow {
+		fr := vm.frame()
+		val := types.NewNull()
+		if fr.evalTop > fr.evalBase {
+			val = vm.pop()
+		}
+		vm.releaseFrameValues()
+		vm.popFrame()
+		vm.control = false
+		return val, false
+	}
+	return vm.takeReturn()
 }

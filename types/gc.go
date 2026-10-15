@@ -16,7 +16,7 @@ const (
 )
 
 func gcNode(v Value) bool {
-	return v.Type == TypeArray || v.Type == TypeObject || v.Type == TypeReference
+	return (v.Type == TypeArray || v.Type == TypeObject || v.Type == TypeReference) && v.Flags&FlagZoneRequest != 0
 }
 func gcID(v Value) uint64 { return uint64(v.Type)<<56 | uint64(v.Extra)<<32 | uint64(v.DataSlot) }
 func gcValue(id uint64) Value {

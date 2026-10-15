@@ -93,21 +93,44 @@ func ReleaseReference(z *zone.Zone, v *Value) {
 // ArrayReference returns an owned alias to an existing element. Missing elements
 // are initialized to null. CoW occurs before a previously unshared cell is exposed.
 func ArrayReference(z *zone.Zone, a *Value, key Value, warn func(ArrayWarning) error) (Value, error) {
+	if z == nil || z == processZone {
+		panic("types: write to process zone is forbidden")
+	}
 	if a.Type == TypeReference {
 		a = &refCell(z, *a).Target
+	}
+	az := arrayStorageZone(z, *a)
+	h := arrayHeader(z, *a)
+	if key.IsUndef() {
+		k := h.NextIdx
+		if k == math.MinInt64 {
+			k = 0
+		}
+		key = NewLong(k)
+		if k == math.MaxInt64 && arrayFind(z, az, h, key, arrayKeyHash(z, key)) != EmptySlot {
+			return Value{}, ErrArrayOccupied
+		}
+		r, err := NewReference(z, NewNull())
+		if err != nil {
+			return Value{}, err
+		}
+		if err := arraySetNormalized(z, a, key, r); err != nil {
+			ReleaseReference(z, &r)
+			return Value{}, err
+		}
+		return r, nil
 	}
 	key, err := NormalizeArrayKey(z, key, warn)
 	if err != nil {
 		return Value{}, err
 	}
-	h := arrayHeader(z, *a)
-	i := arrayFind(z, h, key, arrayKeyHash(z, key))
+	i := arrayFind(z, az, h, key, arrayKeyHash(z, key))
 	initial := NewNull()
 	if i != EmptySlot {
-		b, _ := arrayData(z, h)
+		b, _ := arrayData(az, h)
 		initial = b[i].Val
 	}
-	if initial.Type == TypeReference && (h.RefCount == 1 || refCell(z, initial).RefCount > 1) {
+	if a.Flags&FlagZoneRequest != 0 && initial.Type == TypeReference && (h.RefCount == 1 || refCell(z, initial).RefCount > 1) {
 		if err := writableArray(z, a, h.Kind, h.Cap, false); err != nil {
 			return Value{}, err
 		}
@@ -179,8 +202,9 @@ func ArrayForEachReference(z *zone.Zone, a *Value, visit func(Value, Value) bool
 			ReleaseValue(z, &key)
 			return nil
 		}
+		az := arrayStorageZone(z, *arr)
 		h = arrayHeader(z, *arr)
-		b, _ = arrayData(z, h)
+		b, _ = arrayData(az, h)
 		if i < h.Used && !b[i].Val.IsUndef() {
 			curKey := b[i].Key
 			if h.Kind == ArrayPacked {
@@ -192,7 +216,7 @@ func ArrayForEachReference(z *zone.Zone, a *Value, visit func(Value, Value) bool
 				continue
 			}
 		}
-		found := arrayFind(z, h, key, arrayKeyHash(z, key))
+		found := arrayFind(z, az, h, key, arrayKeyHash(z, key))
 		ReleaseValue(z, &key)
 		if found != EmptySlot {
 			i = found + 1

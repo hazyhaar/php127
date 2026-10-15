@@ -18,6 +18,12 @@ type compilation struct {
 	funcs       map[string]uint32
 	classes     map[string]*bc.ClassProto
 	nextClassID uint32
+	// nsUses associe à chaque déclaration d'espace de noms ses imports de classes (alias en minuscules vers nom qualifié) ; globalUses porte ceux du code hors espace de noms.
+	nsUses     map[*ast.NamespaceDecl]map[string]string
+	globalUses map[string]string
+	// anonClasses associe chaque expression new class à sa classe déclarée ; anonCount numérote les noms internes.
+	anonClasses map[*ast.ClassDecl]*bc.ClassProto
+	anonCount   int
 }
 
 func (c *compilation) allocClassID() uint32 {
@@ -48,6 +54,7 @@ type emitter struct {
 	temps, iters int
 	class        *bc.ClassProto
 	namespace    string
+	uses         map[string]string
 	labels       map[string]uint32
 	gotos        []gotoPatch
 }
@@ -74,71 +81,73 @@ func Compile(file *ast.File) (prog *bc.Program, err error) {
 		return nil, fmt.Errorf("compiler: arbre absent")
 	}
 	c := &compilation{file: file, prog: &bc.Program{}, funcs: make(map[string]uint32), classes: make(map[string]*bc.ClassProto), nextClassID: bc.ClassUser}
+	c.collectUses()
 	main := c.emitter("{main}")
 	c.prog.Main = main.fn
 
 	type funcEntry struct {
 		decl *ast.FunctionDecl
 		ns   string
+		uses map[string]string
 	}
 	var funcDecls []funcEntry
-	var collectFuncs func(stmts []ast.Stmt, ns string, topLevel bool)
-	collectFuncs = func(stmts []ast.Stmt, ns string, topLevel bool) {
-		currentNS := ns
+	var collectFuncs func(stmts []ast.Stmt, ns string, uses map[string]string, topLevel bool)
+	collectFuncs = func(stmts []ast.Stmt, ns string, uses map[string]string, topLevel bool) {
+		currentNS, currentUses := ns, uses
 		for _, stmt := range stmts {
 			switch s := stmt.(type) {
 			case *ast.NamespaceDecl:
 				if len(s.Body) > 0 {
-					collectFuncs(s.Body, s.Name, topLevel)
+					collectFuncs(s.Body, s.Name, c.nsUses[s], topLevel)
 				} else {
-					currentNS = s.Name
+					currentNS, currentUses = s.Name, c.nsUses[s]
 				}
 			case *ast.DeclareStmt:
-				collectFuncs(s.Body, currentNS, topLevel)
+				collectFuncs(s.Body, currentNS, currentUses, topLevel)
 			case *ast.IfStmt:
-				collectFuncs(s.Body, currentNS, false)
+				collectFuncs(s.Body, currentNS, currentUses, false)
 				for _, cl := range s.ElseIfs {
-					collectFuncs(cl.Body, currentNS, false)
+					collectFuncs(cl.Body, currentNS, currentUses, false)
 				}
-				collectFuncs(s.Else, currentNS, false)
+				collectFuncs(s.Else, currentNS, currentUses, false)
 			case *ast.BlockStmt:
-				collectFuncs(s.Body, currentNS, false)
+				collectFuncs(s.Body, currentNS, currentUses, false)
 			case *ast.SwitchStmt:
 				for _, cs := range s.Cases {
-					collectFuncs(cs.Body, currentNS, false)
+					collectFuncs(cs.Body, currentNS, currentUses, false)
 				}
 			case *ast.TryStmt:
-				collectFuncs(s.Body, currentNS, false)
+				collectFuncs(s.Body, currentNS, currentUses, false)
 				for _, ct := range s.Catches {
-					collectFuncs(ct.Body, currentNS, false)
+					collectFuncs(ct.Body, currentNS, currentUses, false)
 				}
-				collectFuncs(s.Finally, currentNS, false)
+				collectFuncs(s.Finally, currentNS, currentUses, false)
 			case *ast.FunctionDecl:
 				name := strings.ToLower(s.Name)
 				if _, exists := c.funcs[name]; exists {
 					if topLevel {
 						main.fail("redeclaration de fonction " + s.Name)
 					}
-					collectFuncs(s.Body, currentNS, false)
+					collectFuncs(s.Body, currentNS, currentUses, false)
 					continue
 				}
 				c.funcs[name] = uint32(len(c.prog.Funcs))
 				c.prog.Funcs = append(c.prog.Funcs, nil)
-				funcDecls = append(funcDecls, funcEntry{decl: s, ns: currentNS})
-				collectFuncs(s.Body, currentNS, false)
+				funcDecls = append(funcDecls, funcEntry{decl: s, ns: currentNS, uses: currentUses})
+				collectFuncs(s.Body, currentNS, currentUses, false)
 			}
 		}
 	}
-	collectFuncs(file.Stmts, "", true)
+	collectFuncs(file.Stmts, "", c.globalUses, true)
 	main.declareClasses()
 	for _, fe := range funcDecls {
 		f := fe.decl
 		e := c.emitter(f.Name)
-		e.namespace = fe.ns
+		e.namespace, e.uses = fe.ns, fe.uses
 		e.line = uint32(f.Line)
 		e.fn.ReturnByRef = f.ByRef
 		e.params(f.Params)
-		e.fn.ReturnType = typeName(f.ReturnType)
+		e.fn.ReturnType = e.typeName(f.ReturnType)
 		e.fn.Attributes = e.attributes(f.Attrs)
 		e.stmts(f.Body)
 		e.end()
@@ -146,7 +155,7 @@ func Compile(file *ast.File) (prog *bc.Program, err error) {
 	}
 	for _, stmt := range file.Stmts {
 		switch stmt.(type) {
-		case *ast.FunctionDecl, *ast.ClassDecl, *ast.InterfaceDecl, *ast.TraitDecl, *ast.EnumDecl:
+		case *ast.FunctionDecl, *ast.TraitDecl:
 		default:
 			main.stmt(stmt)
 		}
@@ -177,7 +186,132 @@ func Compile(file *ast.File) (prog *bc.Program, err error) {
 	return c.prog, nil
 }
 func (c *compilation) emitter(name string) *emitter {
-	return &emitter{compilation: c, fn: &bc.OpArray{Name: name, Filename: c.file.Filename, StrictTypes: c.file.StrictTypes}, cvs: make(map[string]uint32), line: 1}
+	return &emitter{compilation: c, fn: &bc.OpArray{Name: name, Filename: c.file.Filename, StrictTypes: c.file.StrictTypes}, cvs: make(map[string]uint32), line: 1, uses: c.globalUses}
+}
+
+// collectUses relève les imports de classes (use sans function ni const) de chaque portée d'espace de noms : le corps d'un espace de noms entre accolades, ou les instructions qui suivent une déclaration sans accolades jusqu'à la suivante.
+func (c *compilation) collectUses() {
+	c.nsUses = make(map[*ast.NamespaceDecl]map[string]string)
+	add := func(m map[string]string, stmts []ast.Stmt) map[string]string {
+		for _, stmt := range stmts {
+			u, ok := stmt.(*ast.UseDecl)
+			if !ok {
+				continue
+			}
+			for _, item := range u.Items {
+				if item.Kind != "" {
+					continue
+				}
+				full := strings.TrimPrefix(item.Name, `\`)
+				alias := item.Alias
+				if alias == "" {
+					alias = full[strings.LastIndexByte(full, '\\')+1:]
+				}
+				if m == nil {
+					m = make(map[string]string)
+				}
+				m[strings.ToLower(alias)] = full
+			}
+		}
+		return m
+	}
+	stmts := c.file.Stmts
+	start := 0
+	var current *ast.NamespaceDecl
+	flush := func(end int) {
+		if current == nil {
+			c.globalUses = add(c.globalUses, stmts[start:end])
+		} else {
+			c.nsUses[current] = add(c.nsUses[current], stmts[start:end])
+		}
+	}
+	for i, stmt := range stmts {
+		ns, ok := stmt.(*ast.NamespaceDecl)
+		if !ok {
+			continue
+		}
+		if len(ns.Body) > 0 || ns.Bracketed {
+			c.nsUses[ns] = add(nil, ns.Body)
+			continue
+		}
+		flush(i)
+		current, start = ns, i+1
+	}
+	flush(len(stmts))
+}
+
+// qualifyDecl rend le nom complet d'une classe, interface, trait ou enum déclaré dans l'espace de noms courant.
+func (e *emitter) qualifyDecl(name string) string {
+	if e.namespace == "" {
+		return name
+	}
+	return e.namespace + `\` + name
+}
+
+// resolveClassName applique les règles de résolution de PHP à un nom de classe écrit dans le source : nom complet, préfixe namespace\, alias d'un use sur le premier segment, sinon préfixe de l'espace de noms courant ; self, parent et static restent inchangés.
+func (e *emitter) resolveClassName(name string) string {
+	if name == "" {
+		return name
+	}
+	if name[0] == '\\' {
+		return name[1:]
+	}
+	lower := strings.ToLower(name)
+	switch lower {
+	case "self", "parent", "static":
+		return name
+	}
+	if strings.HasPrefix(lower, `namespace\`) {
+		return e.qualifyDecl(name[len(`namespace\`):])
+	}
+	first, rest, qualified := strings.Cut(name, `\`)
+	if target, ok := e.uses[strings.ToLower(first)]; ok {
+		if qualified {
+			return target + `\` + rest
+		}
+		return target
+	}
+	return e.qualifyDecl(name)
+}
+
+// resolveClassNames résout une liste de noms de classes.
+func (e *emitter) resolveClassNames(names []string) []string {
+	if len(names) == 0 {
+		return names
+	}
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = e.resolveClassName(n)
+	}
+	return out
+}
+
+// builtinTypeNames liste les types natifs qu'une déclaration de type ne résout jamais en nom de classe.
+var builtinTypeNames = map[string]bool{
+	"int": true, "float": true, "string": true, "bool": true, "array": true, "callable": true, "iterable": true,
+	"object": true, "mixed": true, "void": true, "null": true, "never": true, "false": true, "true": true,
+	"self": true, "static": true, "parent": true,
+}
+
+// typeName rend la déclaration de type avec ses noms de classes résolus dans l'espace de noms courant.
+func (e *emitter) typeName(t ast.TypeRef) string {
+	if t.Name != "" && !builtinTypeNames[strings.ToLower(t.Name)] {
+		t.Name = e.resolveClassName(t.Name)
+	}
+	if len(t.Union) > 0 || len(t.Intersection) > 0 {
+		resolve := func(parts []ast.TypeRef) []ast.TypeRef {
+			if len(parts) == 0 {
+				return nil
+			}
+			out := make([]ast.TypeRef, len(parts))
+			for i, part := range parts {
+				out[i] = ast.TypeRef{Position: part.Position, Name: e.typeName(part)}
+			}
+			return out
+		}
+		t.Union, t.Intersection = resolve(t.Union), resolve(t.Intersection)
+	}
+	return typeName(t)
 }
 func (e *emitter) fail(feature string) {
 	panic(&parser.CompileError{Message: "fonctionnalite absente: " + feature, Filename: e.file.Filename, Line: int(e.line)})
@@ -239,7 +373,7 @@ func (e *emitter) attributes(attrs []ast.Attribute) []bc.AttributeProto {
 	}
 	out := make([]bc.AttributeProto, len(attrs))
 	for i, a := range attrs {
-		ap := bc.AttributeProto{Name: a.Name}
+		ap := bc.AttributeProto{Name: e.resolveClassName(a.Name)}
 		for _, arg := range a.Args {
 			ap.Args = append(ap.Args, bc.AttributeArg{Name: arg.Name, Value: e.constant(arg.Value)})
 		}
@@ -255,7 +389,7 @@ func (e *emitter) params(params []ast.Param) {
 			ByRef:      p.ByRef,
 			Variadic:   p.Variadic,
 			Promoted:   p.Modifiers&(ast.Public|ast.Protected|ast.Private) != 0,
-			TypeName:   typeName(p.Type),
+			TypeName:   e.typeName(p.Type),
 			Attributes: e.attributes(p.Attrs),
 		}
 		if p.Default != nil {
@@ -472,16 +606,24 @@ func (e *emitter) stmt(stmt ast.Stmt) {
 	if stmt == nil {
 		return
 	}
-	e.line = uint32(stmt.Location().Line)
+	if l := stmt.Location().Line; l > 0 {
+		e.line = uint32(l)
+	}
 	switch s := stmt.(type) {
 	case *ast.NamespaceDecl:
-		prevNS := e.namespace
-		e.namespace = s.Name
+		prevNS, prevUses := e.namespace, e.uses
+		e.namespace, e.uses = s.Name, e.nsUses[s]
 		if len(s.Body) > 0 {
 			e.stmts(s.Body)
-			e.namespace = prevNS
+			e.namespace, e.uses = prevNS, prevUses
 		}
-	case *ast.UseDecl, *ast.HaltCompilerStmt, *ast.ClassDecl, *ast.InterfaceDecl, *ast.TraitDecl, *ast.EnumDecl:
+	case *ast.UseDecl, *ast.HaltCompilerStmt, *ast.TraitDecl:
+	case *ast.ClassDecl:
+		e.declareAt(s.Name)
+	case *ast.InterfaceDecl:
+		e.declareAt(s.Name)
+	case *ast.EnumDecl:
+		e.declareAt(s.Name)
 	case *ast.FunctionDecl:
 		name := strings.ToLower(s.Name)
 		if _, exists := e.funcs[name]; !exists {
@@ -489,11 +631,11 @@ func (e *emitter) stmt(stmt ast.Stmt) {
 			e.funcs[name] = idx
 			e.prog.Funcs = append(e.prog.Funcs, nil)
 			child := e.compilation.emitter(s.Name)
-			child.namespace = e.namespace
+			child.namespace, child.uses = e.namespace, e.uses
 			child.line = uint32(s.Line)
 			child.fn.ReturnByRef = s.ByRef
 			child.params(s.Params)
-			child.fn.ReturnType = typeName(s.ReturnType)
+			child.fn.ReturnType = child.typeName(s.ReturnType)
 			child.fn.Attributes = child.attributes(s.Attrs)
 			child.stmts(s.Body)
 			child.end()
@@ -768,6 +910,16 @@ func (e *emitter) foreach(s *ast.ForeachStmt) {
 	e.emit(bc.OpFeFree, 0, id, 0)
 	e.closeLoop(l, cont)
 }
+
+// declareAt marque le point d'exécution d'une déclaration de classe, d'interface ou d'enum hissée par
+// declareClasses ; la VM y tranche une liaison restée en attente.
+func (e *emitter) declareAt(name string) {
+	// Une déclaration sans parent, interface ni trait est toujours hissée : aucun marqueur.
+	if p := e.classes[strings.ToLower(e.qualifyDecl(name))]; p != nil && (p.ParentName != "" || len(p.Interfaces) > 0 || len(p.Traits) > 0) {
+		e.emit(bc.OpNop, p.ID, 0, bc.FlagDeclareClass)
+	}
+}
+
 func (e *emitter) classID(name string) uint32 {
 	clean := strings.TrimPrefix(name, `\`)
 	if id, ok := bc.BuiltinClassID(clean); ok {
@@ -796,7 +948,7 @@ func (e *emitter) tryStmt(s *ast.TryStmt) {
 			target.CV = int32(e.cv(c.Var))
 		}
 		for _, name := range c.Types {
-			target.Classes = append(target.Classes, e.classID(name))
+			target.Classes = append(target.Classes, e.classID(e.resolveClassName(name)))
 		}
 		entry.CatchTargets = append(entry.CatchTargets, target)
 		e.emit(bc.OpEnterCatch, uint32(target.CV), 0, 0)

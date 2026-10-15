@@ -195,7 +195,44 @@ const (
 	FlagPopObject   uint16 = 1 << 5
 	FlagClassMagic  uint16 = 1 << 6
 	FlagIsset       uint16 = 1 << 8
+	// FlagSilenceBegin et FlagSilenceEnd portés par OpNop bornent l'évaluation d'une expression précédée de l'opérateur @ :
+	// la VM masque l'affichage des avertissements, notices et dépréciations entre les deux, et toute entrée dans un catch ou un finally du même cadre clôt la région.
+	FlagSilenceBegin uint16 = 1 << 9
+	FlagSilenceEnd   uint16 = 1 << 10
+	// FlagDimWrite porté par OpFetchDimR lit un conteneur intermédiaire d'une écriture imbriquée ($a[x][y] = v) :
+	// un conteneur nul, indéfini ou faux sera créé par l'écriture, sa lecture n'émet donc aucun avertissement.
+	FlagDimWrite uint16 = 1 << 11
+	// FlagFuncArg porté par OpLoadCV, OpFetchDimR, OpFetchPropR et OpSendVal évalue un argument d'un appel dont
+	// la cible n'est connue qu'à l'exécution : la VM lit la signature de l'appelé et choisit, comme SEND_VAR_EX
+	// et FETCH_*_FUNC_ARG de PHP, la lecture par référence ou par valeur.
+	FlagFuncArg uint16 = 1 << 12
+	// FlagUnpack porté par OpAppendArrayElement déploie un tableau ou un Traversable dans le littéral ([...$x]) :
+	// clés entières renumérotées, clés chaînes conservées comme en PHP 8.1.
+	FlagUnpack uint16 = 1 << 13
+	// FlagDynamicClass porté par OpInitNew, OpInstanceof, OpInitStaticMethodCall, OpFetchClassConst,
+	// OpFetchStaticPropR et OpAssignStaticProp remplace l'identifiant de classe par l'indice de la variable
+	// compilée qui désigne la classe à l'exécution : objet (sa classe) ou chaîne (nom de classe).
+	FlagDynamicClass uint16 = 1 << 14
+	// FlagDeclareClass porté par OpNop marque le point du source où PHP déclare la classe, l'interface ou l'enum
+	// d'identifiant Op1 : la VM y lie une déclaration restée en attente ou lève l'Error de la dépendance absente,
+	// avant l'instruction suivante.
+	FlagDeclareClass uint16 = 1 << 15
 )
+
+// ClassOperandCV rend l'indice de variable compilée d'une instruction à opérande de classe dynamique : Op1 pour
+// OpInitNew et OpInstanceof, Op2 pour les autres ; faux si l'instruction ne porte pas FlagDynamicClass.
+func ClassOperandCV(in Instr) (uint32, bool) {
+	if in.Flags&FlagDynamicClass == 0 {
+		return 0, false
+	}
+	switch in.Op {
+	case OpInitNew, OpInstanceof:
+		return in.Op1, true
+	case OpInitStaticMethodCall, OpFetchClassConst, OpFetchStaticPropR, OpAssignStaticProp:
+		return in.Op2, true
+	}
+	return 0, false
+}
 
 const (
 	NoPC uint32 = ^uint32(0)
@@ -240,51 +277,60 @@ const (
 )
 
 const (
-	ClassFiber               uint32 = 5201
-	ClassFiberError          uint32 = 5202
-	ClassSplDoublyLinkedList uint32 = 5301
-	ClassSplStack            uint32 = 5302
-	ClassSplQueue            uint32 = 5303
-	ClassSplFixedArray       uint32 = 5304
-	ClassSplObjectStorage    uint32 = 5305
-	ClassArrayObject         uint32 = 5306
-	ClassArrayIterator       uint32 = 5307
-	ClassStdClass            uint32 = 0x5c1a55
-	ClassPDO                              uint32 = 0x50444f01
-	ClassPDOStatement                     uint32 = 0x50444f02
-	ClassPDOException                     uint32 = 0x50444f03
-	ClassDateTime                         uint32 = 5401
-	ClassDateTimeImmutable                uint32 = 5402
-	ClassDateTimeZone                     uint32 = 5403
-	ClassDateInterval                     uint32 = 5404
-	ClassDatePeriod                       uint32 = 5405
-	ClassDateTimeInterface                uint32 = 5406
-	ClassDateError                        uint32 = 5407
-	ClassDateObjectError                  uint32 = 5408
-	ClassDateRangeError                   uint32 = 5409
-	ClassDateException                    uint32 = 5410
-	ClassDateInvalidTimeZoneException     uint32 = 5411
-	ClassDateInvalidOperationException    uint32 = 5412
-	ClassDateMalformedStringException     uint32 = 5413
+	ClassFiber                                uint32 = 5201
+	ClassFiberError                           uint32 = 5202
+	ClassSplDoublyLinkedList                  uint32 = 5301
+	ClassSplStack                             uint32 = 5302
+	ClassSplQueue                             uint32 = 5303
+	ClassSplFixedArray                        uint32 = 5304
+	ClassSplObjectStorage                     uint32 = 5305
+	ClassArrayObject                          uint32 = 5306
+	ClassArrayIterator                        uint32 = 5307
+	ClassStdClass                             uint32 = 0x5c1a55
+	ClassPDO                                  uint32 = 0x50444f01
+	ClassPDOStatement                         uint32 = 0x50444f02
+	ClassPDOException                         uint32 = 0x50444f03
+	ClassDateTime                             uint32 = 5401
+	ClassDateTimeImmutable                    uint32 = 5402
+	ClassDateTimeZone                         uint32 = 5403
+	ClassDateInterval                         uint32 = 5404
+	ClassDatePeriod                           uint32 = 5405
+	ClassDateTimeInterface                    uint32 = 5406
+	ClassDateError                            uint32 = 5407
+	ClassDateObjectError                      uint32 = 5408
+	ClassDateRangeError                       uint32 = 5409
+	ClassDateException                        uint32 = 5410
+	ClassDateInvalidTimeZoneException         uint32 = 5411
+	ClassDateInvalidOperationException        uint32 = 5412
+	ClassDateMalformedStringException         uint32 = 5413
 	ClassDateMalformedIntervalStringException uint32 = 5414
-	ClassReflectionException              uint32 = 5501
-	ClassReflectionClass                  uint32 = 5502
-	ClassReflectionObject                 uint32 = 5503
-	ClassReflectionMethod                 uint32 = 5504
-	ClassReflectionFunction               uint32 = 5505
-	ClassReflectionProperty               uint32 = 5506
-	ClassReflectionParameter              uint32 = 5507
-	ClassReflectionClassConstant          uint32 = 5508
-	ClassReflectionEnum                   uint32 = 5509
-	ClassReflectionEnumUnitCase           uint32 = 5510
-	ClassReflectionEnumBackedCase         uint32 = 5511
-	ClassReflectionNamedType              uint32 = 5512
-	ClassReflectionUnionType              uint32 = 5513
-	ClassReflectionIntersectionType       uint32 = 5514
-	ClassReflectionAttribute              uint32 = 5515
-	ClassReflector                        uint32 = 5516
-	ClassReflectionType                   uint32 = 5517
-	ClassReflectionFunctionAbstract       uint32 = 5518
+	ClassReflectionException                  uint32 = 5501
+	ClassReflectionClass                      uint32 = 5502
+	ClassReflectionObject                     uint32 = 5503
+	ClassReflectionMethod                     uint32 = 5504
+	ClassReflectionFunction                   uint32 = 5505
+	ClassReflectionProperty                   uint32 = 5506
+	ClassReflectionParameter                  uint32 = 5507
+	ClassReflectionClassConstant              uint32 = 5508
+	ClassReflectionEnum                       uint32 = 5509
+	ClassReflectionEnumUnitCase               uint32 = 5510
+	ClassReflectionEnumBackedCase             uint32 = 5511
+	ClassReflectionNamedType                  uint32 = 5512
+	ClassReflectionUnionType                  uint32 = 5513
+	ClassReflectionIntersectionType           uint32 = 5514
+	ClassReflectionAttribute                  uint32 = 5515
+	ClassReflector                            uint32 = 5516
+	ClassReflectionType                       uint32 = 5517
+	ClassReflectionFunctionAbstract           uint32 = 5518
+	ClassMysqli                               uint32 = 5701
+	ClassMysqliResult                         uint32 = 5702
+	ClassMysqliStmt                           uint32 = 5703
+	ClassMysqliDriver                         uint32 = 5704
+	ClassMysqliSqlException                   uint32 = 5705
+	ClassGdImage                              uint32 = 5801
+	ClassFinfo                                uint32 = 5802
+	ClassCurlHandle                           uint32 = 5803
+	ClassXMLParser                            uint32 = 5804
 )
 
 const ClassUser uint32 = 64

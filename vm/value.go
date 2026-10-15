@@ -1,13 +1,14 @@
 package vm
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
 
 	"code.hazyhaar.fr/devhoros/php127/bytecode"
+	"code.hazyhaar.fr/devhoros/php127/spl"
 	"code.hazyhaar.fr/devhoros/php127/types"
+	"code.hazyhaar.fr/devhoros/php127/zone"
 )
 
 func (vm *VM) opConst(in bytecode.Instr) {
@@ -178,6 +179,12 @@ func (vm *VM) resolveDynamicCVName(idx uint32) (string, bool) {
 }
 
 func (vm *VM) opLoadCV(in bytecode.Instr) {
+	if in.Flags&bytecode.FlagFuncArg != 0 {
+		in.Flags = 0
+		if vm.funcArgByRef() {
+			in.Flags = bytecode.FlagLoadRef
+		}
+	}
 	fr := vm.frame()
 	if in.Flags&(bytecode.FlagUseThis|bytecode.FlagGlobal) == 0 && int(in.Op1) < len(fr.fn.CVNames) && strings.HasPrefix(fr.fn.CVNames[in.Op1], "$") {
 		targetName, _ := vm.resolveDynamicCVName(in.Op1)
@@ -354,6 +361,7 @@ func (vm *VM) bindGlobal(idx uint32) {
 			ref = r
 		}
 	}
+	materializeGlobal(vm.Zone, ref)
 	owned := types.RetainReference(vm.Zone, ref)
 	slot := vm.cvPtr(idx)
 	old := *slot
@@ -363,6 +371,13 @@ func (vm *VM) bindGlobal(idx uint32) {
 }
 
 func rOrSlot(p *types.Value) types.Value { return *p }
+
+// materializeGlobal pose null dans une variable globale partagée jamais affectée : en PHP, global $x crée $x à null dans la table globale.
+func materializeGlobal(z *zone.Zone, ref types.Value) {
+	if ref.Type == types.TypeReference && types.Deref(z, ref).IsUndef() {
+		types.AssignRef(z, ref, types.NewNull())
+	}
+}
 
 func (vm *VM) lookupConst(name string) types.Value {
 	v, ok := vm.findConst(name)
@@ -375,6 +390,11 @@ func (vm *VM) lookupConst(name string) types.Value {
 func (vm *VM) findConst(name string) (types.Value, bool) {
 	if vm.constCache != nil {
 		if v, ok := vm.constCache[name]; ok {
+			return types.RetainValue(vm.Zone, v), true
+		}
+	}
+	if vm.Context != nil && vm.Context.ArchtimeImage != nil {
+		if v, ok := vm.Context.ArchtimeImage.Constants[name]; ok {
 			return types.RetainValue(vm.Zone, v), true
 		}
 	}
@@ -413,6 +433,12 @@ func (vm *VM) findConst(name string) (types.Value, bool) {
 		v, err := types.NewStringLiteral(vm.Zone, "cli")
 		if err != nil {
 			vm.fatalFeature("constante PHP_SAPI")
+		}
+		return v, true
+	case "PHP_OS", "PHP_OS_FAMILY":
+		v, err := types.NewStringLiteral(vm.Zone, "Linux")
+		if err != nil {
+			vm.fatalFeature("constante PHP_OS")
 		}
 		return v, true
 	case "PHP_MAJOR_VERSION":
@@ -685,12 +711,18 @@ func (vm *VM) issetCV(idx uint32) bool {
 	if slot.IsUndef() {
 		if fr.dynamicLocals != nil && int(idx) < len(fr.fn.CVNames) {
 			if dv, ok := fr.dynamicLocals[fr.fn.CVNames[idx]]; ok && !dv.IsUndef() {
-				return !types.Deref(vm.Zone, dv).IsNull()
+				return isSetValue(vm.Zone, dv)
 			}
 		}
 		return false
 	}
-	return !types.Deref(vm.Zone, slot).IsNull()
+	return isSetValue(vm.Zone, slot)
+}
+
+// isSetValue applique la sémantique de isset : une valeur nulle, ou une référence partagée vers une variable jamais affectée, n'est pas posée.
+func isSetValue(z *zone.Zone, v types.Value) bool {
+	d := types.Deref(z, v)
+	return !d.IsNull() && !d.IsUndef()
 }
 
 func (vm *VM) opMakeRef() {
@@ -768,6 +800,8 @@ func (vm *VM) num(v types.Value) types.Value {
 		out = types.NewLong(0)
 	case types.TypeString:
 		out = parseNum(types.StringData(vm.Zone, v))
+	case types.TypeResource:
+		out = types.NewLong(int64(v.DataSlot))
 	default:
 		vm.raiseBuiltin(bytecode.ClassTypeError, "Unsupported operand types", 0)
 		return types.NewLong(0)
@@ -849,10 +883,7 @@ func (vm *VM) toIntWithDeprecation(v types.Value) int64 {
 	if v.Type == types.TypeDouble {
 		f := v.ToDouble()
 		if !math.IsNaN(f) && !math.IsInf(f, 0) && math.Trunc(f) != f {
-			if vm.errorReporting&8192 != 0 && vm.Out != nil {
-				file, line := vm.currentLoc()
-				_, _ = fmt.Fprintf(vm.Out, "\nDeprecated: Implicit conversion from float %s to int loses precision in %s on line %d\n", strconv.FormatFloat(f, 'g', -1, 64), file, line)
-			}
+			vm.raiseDiag(eDeprecated, diagDeprecate, "Implicit conversion from float "+strconv.FormatFloat(f, 'g', -1, 64)+" to int loses precision", vm.line)
 		}
 		return types.FloatToInt(f)
 	}
@@ -982,6 +1013,18 @@ func (vm *VM) opBinary(op bytecode.Opcode) {
 			}
 		}
 	}
+	if res, handled := vm.arrayOperands(op, l, r); handled {
+		// Le résultat est empilé avant la libération des opérandes, qui peut déclencher un destructeur.
+		if !vm.stop && !vm.control {
+			vm.push(res)
+		}
+		vmRelease(vm.Zone, &r)
+		vmRelease(vm.Zone, &l)
+		if !vm.stop && !vm.control {
+			vm.bump()
+		}
+		return
+	}
 	switch op {
 	case bytecode.OpAdd:
 		vm.push(types.Add(vm.num(l), vm.num(r)))
@@ -1048,6 +1091,82 @@ func (vm *VM) opBinary(op bytecode.Opcode) {
 	if !vm.stop {
 		vm.bump()
 	}
+}
+
+// arithmeticSymbols nomme, pour le message de TypeError, les opérateurs arithmétiques et binaires qui refusent un tableau.
+var arithmeticSymbols = map[bytecode.Opcode]string{
+	bytecode.OpAdd: "+", bytecode.OpSub: "-", bytecode.OpMul: "*", bytecode.OpDiv: "/", bytecode.OpMod: "%",
+	bytecode.OpPow: "**", bytecode.OpSL: "<<", bytecode.OpSR: ">>", bytecode.OpBWOr: "|", bytecode.OpBWAnd: "&", bytecode.OpBWXor: "^",
+}
+
+// arrayOperands traite un opérateur arithmétique dont un opérande est un tableau : l'union de deux tableaux pour +,
+// la TypeError de PHP sinon. Les opérandes sont empruntés ; le résultat appartient à l'appelant. handled est faux
+// lorsqu'aucun opérande n'est un tableau.
+func (vm *VM) arrayOperands(op bytecode.Opcode, l, r types.Value) (types.Value, bool) {
+	ld, rd := types.Deref(vm.Zone, l), types.Deref(vm.Zone, r)
+	if ld.Type != types.TypeArray && rd.Type != types.TypeArray {
+		return types.Value{}, false
+	}
+	sym, arith := arithmeticSymbols[op]
+	if !arith {
+		return types.Value{}, false
+	}
+	if op == bytecode.OpAdd && ld.Type == types.TypeArray && rd.Type == types.TypeArray {
+		return vm.arrayUnion(ld, rd), true
+	}
+	vm.raiseBuiltin(bytecode.ClassTypeError, "Unsupported operand types: "+vm.operandTypeName(ld)+" "+sym+" "+vm.operandTypeName(rd), 0)
+	return types.Value{}, true
+}
+
+// arrayUnion construit $l + $r : les éléments de $l, puis ceux de $r dont la clé est absente de $l, dans l'ordre.
+// Le tableau gauche est partagé tant qu'aucune clé ne s'ajoute ; ArraySet le sépare dans l'arène à la première
+// insertion et retient chaque valeur ajoutée.
+func (vm *VM) arrayUnion(ld, rd types.Value) types.Value {
+	res := types.RetainValue(vm.Zone, ld)
+	if types.ArrayLen(vm.Zone, rd) == 0 {
+		return res
+	}
+	var failed error
+	types.ArrayForEach(vm.Zone, rd, func(k, v types.Value) bool {
+		exists, err := types.ArrayKeyExists(vm.Zone, res, k, nil)
+		if err == nil && !exists {
+			err = types.ArraySet(vm.Zone, &res, k, v, nil)
+		}
+		failed = err
+		return err == nil
+	})
+	if failed != nil {
+		vmRelease(vm.Zone, &res)
+		vm.raiseBuiltin(bytecode.ClassError, failed.Error(), 0)
+		return types.Value{}
+	}
+	return res
+}
+
+// operandTypeName rend le nom de type d'un opérande dans les messages d'opérateur de PHP : nom de classe pour un objet.
+func (vm *VM) operandTypeName(v types.Value) string {
+	switch v.Type {
+	case types.TypeUndef, types.TypeNull:
+		return "null"
+	case types.TypeFalse, types.TypeTrue:
+		return "bool"
+	case types.TypeLong:
+		return "int"
+	case types.TypeDouble:
+		return "float"
+	case types.TypeString:
+		return "string"
+	case types.TypeArray:
+		return "array"
+	case types.TypeObject:
+		return vm.className(types.ObjectInfo(vm.Zone, v).ClassID)
+	case types.TypeResource:
+		if cid, ok := opaqueResourceClassID(v.Extra); ok {
+			return vm.className(cid)
+		}
+		return "resource"
+	}
+	return "mixed"
 }
 
 func (vm *VM) opMod(l, r types.Value) {
@@ -1197,9 +1316,11 @@ func (vm *VM) cast(v types.Value, kind uint32) {
 	case bytecode.CastBool:
 		vm.push(types.NewBool(types.ToBoolZ(vm.Zone, v)))
 	case bytecode.CastString:
-		s, _ := vm.stringify(v)
+		s, own := vm.stringify(v)
 		if !vm.stop {
 			vm.push(types.RetainValue(vm.Zone, s))
+		}
+		if own {
 			types.ReleaseValue(vm.Zone, &s)
 		}
 	case bytecode.CastUnset:
@@ -1217,6 +1338,11 @@ func (vm *VM) cast(v types.Value, kind uint32) {
 		}
 		if d.Type == types.TypeNull || d.Type == types.TypeUndef {
 			vm.push(arr)
+			return
+		}
+		if d.Type == types.TypeObject && types.ObjectInfo(vm.Zone, d).ClassID != bytecode.ClassClosure {
+			types.ReleaseValue(vm.Zone, &arr)
+			vm.push(vm.objectToArray(d))
 			return
 		}
 		if err := types.ArrayAppend(vm.Zone, &arr, d); err != nil {
@@ -1257,6 +1383,61 @@ func (vm *VM) cast(v types.Value, kind uint32) {
 	default:
 		vm.fatalFeature("conversion")
 	}
+}
+
+// objectToArray applique (array) à un objet : toutes les propriétés initialisées, privées sous la clé
+// "\0Classe\0nom", protégées sous "\0*\0nom", puis les propriétés dynamiques ; un ArrayObject rend son stockage.
+func (vm *VM) objectToArray(d types.Value) types.Value {
+	info := types.ObjectInfo(vm.Zone, d)
+	if info.ClassID == bytecode.ClassArrayObject {
+		if ao, err := spl.ArrayObjectFromObject(vm.Zone, d); err == nil {
+			if copyArr, cerr := ao.GetArrayCopy(vm.Zone); cerr == nil {
+				return copyArr
+			}
+		}
+	}
+	arr, err := types.NewArray(vm.Zone)
+	if err != nil {
+		vm.fatalFeature("tableau")
+		return types.NewNull()
+	}
+	if c := vm.classByID(info.ClassID); c != nil && c.PropsResolved {
+		for _, p := range c.ResolvedProps {
+			if p.Static {
+				continue
+			}
+			pv := types.ObjectGet(vm.Zone, d, p.Index)
+			if pv.IsUndef() {
+				continue
+			}
+			name := p.Name
+			switch p.Visibility {
+			case bytecode.VisProtected:
+				name = "\x00*\x00" + name
+			case bytecode.VisPrivate:
+				owner := ""
+				if oc := vm.classByID(p.ClassID); oc != nil {
+					owner = oc.Name
+				}
+				name = "\x00" + owner + "\x00" + name
+			}
+			k, kerr := types.NewStringLiteral(vm.Zone, name)
+			if kerr != nil {
+				vm.fatalFeature("tableau")
+				return arr
+			}
+			_ = types.ArraySet(vm.Zone, &arr, k, types.Deref(vm.Zone, pv), nil)
+			types.ReleaseValue(vm.Zone, &k)
+		}
+	}
+	if info.DynOffset != types.EmptySlot {
+		dynArr := types.Value{Type: types.TypeArray, Flags: types.FlagZoneRequest, DataSlot: info.DynOffset}
+		types.ArrayForEach(vm.Zone, dynArr, func(k, dv types.Value) bool {
+			_ = types.ArraySet(vm.Zone, &arr, k, types.Deref(vm.Zone, dv), nil)
+			return true
+		})
+	}
+	return arr
 }
 
 func (vm *VM) opCmp(op bytecode.Opcode) {
@@ -1477,10 +1658,7 @@ func (vm *VM) stepIncDec(cur types.Value, isInc bool) types.Value {
 		if isInc {
 			return types.NewLong(1)
 		}
-		if vm.errorReporting&2 != 0 && vm.Out != nil {
-			file, line := vm.currentLoc()
-			_, _ = fmt.Fprintf(vm.Out, "\nWarning: Decrement on type null has no effect, this will change in the next major version of PHP in %s on line %d\n", file, line)
-		}
+		vm.emitWarning("Decrement on type null has no effect, this will change in the next major version of PHP", vm.line)
 		return types.NewNull()
 	case types.TypeTrue, types.TypeFalse:
 		return cur

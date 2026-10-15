@@ -30,6 +30,11 @@ func (vm *VM) valueType(v types.Value) string {
 		return "array"
 	case types.TypeObject:
 		return vm.className(types.ObjectInfo(vm.Zone, v).ClassID)
+	case types.TypeResource:
+		if cid, ok := opaqueResourceClassID(v.Extra); ok {
+			return vm.className(cid)
+		}
+		return "resource"
 	default:
 		return "resource"
 	}
@@ -75,6 +80,10 @@ func (vm *VM) matchesType(v types.Value, name string, scope, called uint32) bool
 	case "array":
 		return v.Type == types.TypeArray
 	case "object":
+		if v.Type == types.TypeResource {
+			_, ok := opaqueResourceClassID(v.Extra)
+			return ok
+		}
 		return v.Type == types.TypeObject
 	case "iterable":
 		if v.Type == types.TypeArray {
@@ -85,7 +94,12 @@ func (vm *VM) matchesType(v types.Value, name string, scope, called uint32) bool
 		_, ok := vm.callback(v)
 		return ok
 	}
-	if v.Type != types.TypeObject {
+	var objClass uint32
+	if v.Type == types.TypeObject {
+		objClass = types.ObjectInfo(vm.Zone, v).ClassID
+	} else if cid, ok := opaqueResourceClassID(v.Extra); v.Type == types.TypeResource && ok {
+		objClass = cid
+	} else {
 		return false
 	}
 	want, ok := vm.resolveName(name)
@@ -98,7 +112,7 @@ func (vm *VM) matchesType(v types.Value, name string, scope, called uint32) bool
 	case "static":
 		want, ok = called, called != 0
 	}
-	return ok && vm.isInstance(types.ObjectInfo(vm.Zone, v).ClassID, want)
+	return ok && vm.isInstance(objClass, want)
 }
 
 func (vm *VM) coerceType(value *types.Value, name string, strict bool, scope, called uint32) bool {
@@ -155,7 +169,7 @@ func (vm *VM) coerceType(value *types.Value, name string, strict bool, scope, ca
 				if v.Type == types.TypeString {
 					from = "float-string \"" + types.StringData(vm.Zone, v) + "\""
 				}
-				fmt.Fprintf(vm.Out, "\nDeprecated: Implicit conversion from %s to int loses precision in %s on line %d\n", from, vm.file(), vm.line)
+				vm.raiseDiag(eDeprecated, diagDeprecate, "Implicit conversion from "+from+" to int loses precision", vm.line)
 			}
 			return replace(types.NewLong(int64(number)))
 		}

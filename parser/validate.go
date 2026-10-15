@@ -334,7 +334,8 @@ func (v *validator) statements(stmts []ast.Stmt, scope string, statics map[strin
 }
 
 func (v *validator) class(c classInfo, attrs []ast.Attribute) {
-	if v.namespace != "" {
+	anonymous := c.name == ""
+	if !anonymous && v.namespace != "" {
 		c.name = v.namespace + "\\" + c.name
 	}
 	if c.parent != "" {
@@ -343,6 +344,18 @@ func (v *validator) class(c classInfo, attrs []ast.Attribute) {
 	c.interfaces = slices.Clone(c.interfaces)
 	for i, name := range c.interfaces {
 		c.interfaces[i] = v.qualify(name)
+	}
+	// Une classe anonyme porte le nom que Zend lui génère (parent, sinon première interface, sinon class, suivi de
+	// @anonymous) ; ses méthodes sont validées dans un contexte de classe, constructeur à propriétés promues compris.
+	if anonymous {
+		switch {
+		case c.parent != "":
+			c.name = c.parent + "@anonymous"
+		case len(c.interfaces) > 0:
+			c.name = c.interfaces[0] + "@anonymous"
+		default:
+			c.name = "class@anonymous"
+		}
 	}
 	if c.mods&(ast.Final|ast.Abstract) == ast.Final|ast.Abstract {
 		v.fail(c.pos, "Cannot use the final modifier on an abstract class")
@@ -356,7 +369,9 @@ func (v *validator) class(c classInfo, attrs []ast.Attribute) {
 		}
 	}
 	parent, known := v.classes[lower(c.parent)]
-	deferredBinding := v.conditional > 0 || v.function != nil
+	// Zend lie à l'exécution une classe anonyme qui hérite ou implémente : ni parent final ni #[\Override] n'y sont
+	// vérifiés à la compilation.
+	deferredBinding := v.conditional > 0 || v.function != nil || anonymous && (c.parent != "" || len(c.interfaces) > 0)
 	if deferredBinding {
 		known = false
 	}

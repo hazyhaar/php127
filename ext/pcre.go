@@ -45,6 +45,7 @@ func nativePregMatch(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value
 	}
 	ref := arg(args, 2)
 	if offset > int64(len(subject)) {
+		setPregError(z, pregInternalError)
 		empty, err := newArray(z)
 		if err != nil {
 			return types.Value{}, err
@@ -55,6 +56,7 @@ func nativePregMatch(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value
 	if p, ok := parsePattern(pattern); ok && offset >= 0 && flagsKnown(flags, flagOffsetCapture|flagUnmatchedAsNull) && re2Safe(p, subject, int(offset)) {
 		if v, err, used := goMatch(z, p, subject, flags, int(offset), ref, false); used {
 			re2Hits.Add(1)
+			setPregError(z, pregNoError)
 			return v, err
 		}
 	}
@@ -72,6 +74,7 @@ func nativePregMatchAll(z *zone.Zone, _ io.Writer, args []types.Value) (types.Va
 	}
 	ref := arg(args, 2)
 	if offset > int64(len(subject)) {
+		setPregError(z, pregInternalError)
 		empty, err := newArray(z)
 		if err != nil {
 			return types.Value{}, err
@@ -83,6 +86,7 @@ func nativePregMatchAll(z *zone.Zone, _ io.Writer, args []types.Value) (types.Va
 	if p, ok := parsePattern(pattern); ok && offset >= 0 && flagsKnown(flags, known) && re2Safe(p, subject, int(offset)) {
 		if v, err, used := goMatch(z, p, subject, flags, int(offset), ref, true); used {
 			re2Hits.Add(1)
+			setPregError(z, pregNoError)
 			return v, err
 		}
 	}
@@ -165,6 +169,7 @@ func nativePregReplace(z *zone.Zone, _ io.Writer, args []types.Value) (types.Val
 		if p, ok := parsePattern(pattern); ok && re2Safe(p, subject, 0) {
 			if v, err, used := goReplace(z, p, repl, subject, limit, countRef); used {
 				re2Hits.Add(1)
+				setPregError(z, pregNoError)
 				return v, err
 			}
 		}
@@ -276,6 +281,7 @@ func nativePregSplit(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value
 	if p, ok := parsePattern(pattern); ok && flagsKnown(flags, known) && re2Safe(p, subject, 0) {
 		if v, err, used := goSplit(z, p, subject, limit, flags); used {
 			re2Hits.Add(1)
+			setPregError(z, pregNoError)
 			return v, err
 		}
 	}
@@ -319,6 +325,7 @@ func nativePregGrep(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value,
 	if p, ok := parsePattern(pattern); ok && flagsKnown(flags, flagGrepInvert) && re2Safe(p, "", 0) && grepASCII(z, args[1], p) {
 		if v, err, used := goGrep(z, p, args[1], flags); used {
 			re2Hits.Add(1)
+			setPregError(z, pregNoError)
 			return v, err
 		}
 	}
@@ -529,7 +536,7 @@ func compileGo(pat string) (*regexp.Regexp, bool) {
 	if err != nil {
 		return nil, false
 	}
-	reCache.Store(pat, re)
+	reCache.Store(strings.Clone(pat), re)
 	return re, true
 }
 

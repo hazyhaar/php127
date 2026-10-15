@@ -8,10 +8,12 @@ import (
 	"unsafe"
 
 	"code.hazyhaar.fr/devhoros/php127/bytecode"
+	"code.hazyhaar.fr/devhoros/php127/compiler"
 	"code.hazyhaar.fr/devhoros/php127/datetime"
 	"code.hazyhaar.fr/devhoros/php127/ext"
 	"code.hazyhaar.fr/devhoros/php127/fiber"
 	"code.hazyhaar.fr/devhoros/php127/filter"
+	"code.hazyhaar.fr/devhoros/php127/mysqli"
 	"code.hazyhaar.fr/devhoros/php127/pdo"
 	"code.hazyhaar.fr/devhoros/php127/reflection"
 	"code.hazyhaar.fr/devhoros/php127/sapi"
@@ -25,6 +27,10 @@ import (
 
 func init() {
 	registerBuiltinClassNames()
+	compiler.NativeByValue = func(name string) bool {
+		_, ok := lookupNative(name)
+		return ok && !intrinsicExists(strings.ToLower(strings.TrimPrefix(name, `\`))) && !bytecode.NativeHasRefArgs(name)
+	}
 }
 
 func vmRetain(z *zone.Zone, v types.Value) types.Value {
@@ -51,6 +57,7 @@ func registerBuiltinClassNames() {
 	fiber.EnsureClassNames()
 	datetime.EnsureClassNames()
 	reflection.EnsureClassNames()
+	mysqli.EnsureClassNames()
 	ids := []uint32{
 		bytecode.ClassException,
 		bytecode.ClassError,
@@ -122,6 +129,11 @@ func registerBuiltinClassNames() {
 		bytecode.ClassReflectionFunctionAbstract,
 		bytecode.ClassJsonSerializable,
 		bytecode.ClassStringable,
+		bytecode.ClassMysqli,
+		bytecode.ClassMysqliResult,
+		bytecode.ClassMysqliStmt,
+		bytecode.ClassMysqliDriver,
+		bytecode.ClassMysqliSqlException,
 	}
 	for _, id := range ids {
 		if name, ok := bytecode.BuiltinClassName(id); ok {
@@ -160,6 +172,9 @@ func lookupNative(name string) (stdlib.NativeFunc, bool) {
 	if fn, ok := filter.Lookup(clean); ok {
 		return fn, true
 	}
+	if fn, ok := mysqli.Lookup(clean); ok {
+		return fn, true
+	}
 	switch strings.ToLower(clean) {
 	case "spl_object_id":
 		return func(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
@@ -195,31 +210,17 @@ func lookupNative(name string) (stdlib.NativeFunc, bool) {
 	return nil, false
 }
 
-func nativeArgIsRef(name string, idx int) bool {
-	switch strings.ToLower(strings.TrimPrefix(name, `\`)) {
-	case "preg_match", "preg_match_all":
-		return idx == 2
-	case "preg_replace", "preg_replace_callback":
-		return idx == 4
-	case "str_replace", "str_ireplace":
-		return idx == 3
-	case "parse_str":
-		return idx == 1
-	case "headers_sent":
-		return idx == 0 || idx == 1
-	case "exec":
-		return idx == 1 || idx == 2
-	case "natsort", "natcasesort", "shuffle", "settype":
-		return idx == 0
-	case "array_multisort":
-		return true
-	case "similar_text":
-		return idx == 2
-	case "sscanf":
-		return idx >= 2
-	default:
+// mysqliClass reconnaît les classes servies par le paquet mysqli.
+func mysqliClass(id uint32) bool {
+	return id >= bytecode.ClassMysqli && id <= bytecode.ClassMysqliSqlException
+}
+
+// mysqliMethodArgIsRef indique les arguments d'une méthode mysqli transmis par référence : variables liées de bind_param (à partir du deuxième) et de bind_result (toutes).
+func mysqliMethodArgIsRef(classID uint32, method string, idx int) bool {
+	if classID != bytecode.ClassMysqliStmt {
 		return false
 	}
+	return bytecode.NativeMethodArgIsRef(method, idx)
 }
 
 func (vm *VM) raiseNativeError(err error, funcName string, args []types.Value, line uint32) {
@@ -231,6 +232,24 @@ func (vm *VM) raiseNativeError(err error, funcName string, args []types.Value, l
 		obj, objErr := pdo.NewPDOExceptionObject(vm.Zone, pe)
 		if objErr != nil {
 			vm.fatalFeature("PDOException")
+			return
+		}
+		fs, _ := types.NewStringLiteral(vm.Zone, vm.file())
+		types.ObjectSet(vm.Zone, obj, 2, fs)
+		types.ReleaseValue(vm.Zone, &fs)
+		types.ObjectSet(vm.Zone, obj, 3, types.NewLong(int64(line)))
+		pc := 0
+		if len(vm.frames) > 0 {
+			pc = vm.frame().pc
+		}
+		vm.excTrace = []traceItem{tr}
+		vm.throwAt(pc, obj)
+		return
+	}
+	if me, ok := errors.AsType[mysqli.SQLException](err); ok {
+		obj, objErr := mysqli.NewSQLExceptionObject(vm.Zone, me)
+		if objErr != nil {
+			vm.fatalFeature("mysqli_sql_exception")
 			return
 		}
 		fs, _ := types.NewStringLiteral(vm.Zone, vm.file())
@@ -319,6 +338,9 @@ func (vm *VM) raiseNativeError(err error, funcName string, args []types.Value, l
 	if cls == "" {
 		cls = pdo.ExceptionClass(err)
 	}
+	if cls == "" {
+		cls = mysqli.ExceptionClass(err)
+	}
 	classID, ok := bytecode.BuiltinClassID(cls)
 	if !ok {
 		classID = bytecode.ClassError
@@ -384,7 +406,7 @@ func (vm *VM) lookupExtConst(name string) (types.Value, bool) {
 	if iv, ok := filter.Constants()[name]; ok {
 		return types.NewLong(iv), true
 	}
-	for _, table := range []map[string]types.Value{ext.Constants(), streams.Constants(), sapi.Constants()} {
+	for _, table := range extConstTables() {
 		if v, ok := table[name]; ok {
 			if v.Type == types.TypeString {
 				s, err := types.NewStringLiteral(vm.Zone, types.StringData(vm.Zone, v))
@@ -402,6 +424,11 @@ func (vm *VM) lookupExtConst(name string) (types.Value, bool) {
 		}
 	}
 	return types.Value{}, false
+}
+
+// extConstTables énumère, dans l'ordre de priorité de la résolution, les tables de constantes globales exportées par les paquets natifs.
+func extConstTables() []map[string]types.Value {
+	return []map[string]types.Value{ext.Constants(), streams.Constants(), sapi.Constants(), stdlib.Constants(), mysqli.Constants()}
 }
 
 func (vm *VM) lookupNativeClassConst(classID uint32, name string) (types.Value, bool) {
@@ -785,6 +812,23 @@ func (vm *VM) doNativeNew(classID uint32, spec callSpec, line uint32) bool {
 		vm.bump()
 		return true
 
+	case bytecode.ClassMysqli, bytecode.ClassMysqliStmt, bytecode.ClassMysqliDriver:
+		defer vm.releaseArgs(spec.args)
+		name, _ := bytecode.BuiltinClassName(classID)
+		obj, err := mysqli.Construct(vm.Zone, vm.Out, name, vm.derefArgs(spec.args))
+		if err != nil {
+			vm.raiseNativeError(err, name+"::__construct", spec.args, line)
+			return true
+		}
+		vm.push(obj)
+		vm.bump()
+		return true
+
+	case bytecode.ClassMysqliResult:
+		defer vm.releaseArgs(spec.args)
+		vm.raiseBuiltin(bytecode.ClassError, "Cannot directly construct mysqli_result, use mysqli_query() or mysqli::query() instead", 0)
+		return true
+
 	case bytecode.ClassPDO:
 		defer vm.releaseArgs(spec.args)
 		obj, err := pdo.NewPDO(vm.Zone, spec.args...)
@@ -981,6 +1025,8 @@ func (vm *VM) makeFiberCallback(call callSpec, line uint32) fiber.Callback {
 			if inv.flags&bytecode.FlagNative == 0 {
 				fn := vm.Program.Funcs[inv.funcIndex]
 				ret, threw = vm.invokeOpArray(fn, types.Value{}, false, inv.args, 0, 0, line)
+			} else if isPotentialIntrinsic(inv.method) {
+				ret, threw = vm.invokeNativeNested(inv, line)
 			} else if native, ok := lookupNative(inv.method); ok {
 				dargs := make([]types.Value, len(inv.args))
 				for i, a := range inv.args {
@@ -997,6 +1043,8 @@ func (vm *VM) makeFiberCallback(call callSpec, line uint32) fiber.Callback {
 					return types.NewNull(), err
 				}
 				ret = val
+			} else {
+				vm.releaseArgs(inv.args)
 			}
 		default:
 			if m, _, ok := vm.findMethod(inv.classID, inv.method); ok {
@@ -1048,6 +1096,9 @@ func (vm *VM) nativeClassMethod(spec callSpec, called uint32, line uint32) bool 
 		return true
 	case bytecode.ClassPDOStatement:
 		vm.callPDOStmtInstance(obj, spec, line)
+		return true
+	case bytecode.ClassMysqli, bytecode.ClassMysqliResult, bytecode.ClassMysqliStmt:
+		vm.callMysqliInstance(obj, classID, spec, line)
 		return true
 	case bytecode.ClassFiber:
 		vm.callFiberInstance(obj, spec, line)
@@ -1197,6 +1248,49 @@ func (vm *VM) callPDOStmtInstance(obj types.Value, spec callSpec, line uint32) {
 	}
 	vm.push(val)
 	vm.bump()
+}
+
+// callMysqliInstance délègue une méthode d'instance mysqli au paquet ; les variables liées de bind_param et bind_result restent des références, les autres arguments sont déréférencés.
+func (vm *VM) callMysqliInstance(obj types.Value, classID uint32, spec callSpec, line uint32) {
+	defer vm.releaseArgs(spec.args)
+	defer vm.releaseSpecObj(spec)
+	args := make([]types.Value, len(spec.args))
+	for i, a := range spec.args {
+		if mysqliMethodArgIsRef(classID, spec.method, i) && a.Type == types.TypeReference {
+			args[i] = a
+		} else {
+			args[i] = types.Deref(vm.Zone, a)
+		}
+	}
+	name, _ := bytecode.BuiltinClassName(classID)
+	val, err := mysqli.CallMethod(vm.Zone, vm.Out, obj, spec.method, args)
+	if err != nil {
+		vmRelease(vm.Zone, &val)
+		vm.raiseNativeError(err, name+"->"+spec.method, spec.args, line)
+		return
+	}
+	vm.push(val)
+	vm.bump()
+}
+
+// derefArgs rend une copie déréférencée des arguments, sans transfert de propriété.
+func (vm *VM) derefArgs(args []types.Value) []types.Value {
+	out := make([]types.Value, len(args))
+	for i, a := range args {
+		out[i] = types.Deref(vm.Zone, a)
+	}
+	return out
+}
+
+// mysqliPropGet lit une propriété native d'un objet mysqli ; une erreur du paquet est levée en exception et la lecture rend null.
+func (vm *VM) mysqliPropGet(obj types.Value, name string) (types.Value, bool) {
+	v, found, err := mysqli.GetProperty(vm.Zone, obj, name)
+	if err != nil {
+		vmRelease(vm.Zone, &v)
+		vm.raiseNativeError(err, name, nil, vm.line)
+		return types.NewNull(), true
+	}
+	return v, found
 }
 
 func (vm *VM) callFiberInstance(obj types.Value, spec callSpec, line uint32) {
@@ -1813,6 +1907,8 @@ func (vm *VM) makeSPLComparator(cbVal types.Value, fnName string, line uint32) (
 			if inv.flags&bytecode.FlagNative == 0 {
 				fn := vm.Program.Funcs[inv.funcIndex]
 				ret, threw = vm.invokeOpArray(fn, types.Value{}, false, inv.args, 0, 0, line)
+			} else if isPotentialIntrinsic(inv.method) {
+				ret, threw = vm.invokeNativeNested(inv, line)
 			} else if native, found := lookupNative(inv.method); found {
 				dargs := []types.Value{types.Deref(z, a), types.Deref(z, b)}
 				vm.releaseArgs(inv.args)
@@ -1821,6 +1917,8 @@ func (vm *VM) makeSPLComparator(cbVal types.Value, fnName string, line uint32) (
 					return 0, err
 				}
 				ret = val
+			} else {
+				vm.releaseArgs(inv.args)
 			}
 		default:
 			if m, _, found := vm.findMethod(inv.classID, inv.method); found {
@@ -2633,7 +2731,26 @@ func (vm *VM) prepareObjectIter(slot *iterState, obj types.Value) bool {
 	return false
 }
 
+// startedGenerator rend le générateur porté par obj, démarré jusqu'à son premier yield ; nil si obj n'est pas
+// un générateur ou si son démarrage a levé une exception.
+func (vm *VM) startedGenerator(obj types.Value) (*generator, bool) {
+	g := vm.generatorOf(obj)
+	if g == nil {
+		return nil, false
+	}
+	if !g.started && !vm.resumeGenerator(g, types.NewNull(), false) {
+		return nil, true
+	}
+	return g, true
+}
+
 func (vm *VM) iterRewind(obj types.Value) {
+	if g, isGen := vm.startedGenerator(obj); isGen {
+		if g != nil {
+			vm.rewindGenerator(g)
+		}
+		return
+	}
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
 	switch classID {
 	case bytecode.ClassSplDoublyLinkedList, bytecode.ClassSplStack, bytecode.ClassSplQueue:
@@ -2668,6 +2785,9 @@ func (vm *VM) iterRewind(obj types.Value) {
 }
 
 func (vm *VM) iterValid(obj types.Value) bool {
+	if g, isGen := vm.startedGenerator(obj); isGen {
+		return g != nil && !g.done
+	}
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
 	switch classID {
 	case bytecode.ClassSplDoublyLinkedList, bytecode.ClassSplStack, bytecode.ClassSplQueue:
@@ -2706,6 +2826,12 @@ func (vm *VM) iterValid(obj types.Value) bool {
 }
 
 func (vm *VM) iterCurrent(obj types.Value) types.Value {
+	if g, isGen := vm.startedGenerator(obj); isGen {
+		if g == nil || g.done {
+			return types.NewNull()
+		}
+		return types.RetainValue(vm.Zone, g.value)
+	}
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
 	switch classID {
 	case bytecode.ClassSplDoublyLinkedList, bytecode.ClassSplStack, bytecode.ClassSplQueue:
@@ -2742,6 +2868,12 @@ func (vm *VM) iterCurrent(obj types.Value) types.Value {
 }
 
 func (vm *VM) iterKey(obj types.Value) types.Value {
+	if g, isGen := vm.startedGenerator(obj); isGen {
+		if g == nil || g.done {
+			return types.NewNull()
+		}
+		return types.RetainValue(vm.Zone, g.key)
+	}
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
 	switch classID {
 	case bytecode.ClassSplDoublyLinkedList, bytecode.ClassSplStack, bytecode.ClassSplQueue:
@@ -2778,6 +2910,12 @@ func (vm *VM) iterKey(obj types.Value) types.Value {
 }
 
 func (vm *VM) iterNext(obj types.Value) {
+	if g, isGen := vm.startedGenerator(obj); isGen {
+		if g != nil && !g.done {
+			vm.resumeGenerator(g, types.NewNull(), false)
+		}
+		return
+	}
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
 	switch classID {
 	case bytecode.ClassSplDoublyLinkedList, bytecode.ClassSplStack, bytecode.ClassSplQueue:
@@ -2813,6 +2951,11 @@ func (vm *VM) iterNext(obj types.Value) {
 
 func (vm *VM) dynamicPropGet(obj types.Value, name string) (types.Value, bool) {
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
+	if mysqliClass(classID) && classID != bytecode.ClassMysqliSqlException {
+		if v, ok := vm.mysqliPropGet(obj, name); ok {
+			return v, true
+		}
+	}
 	if classID == bytecode.ClassDateInterval {
 		if iv, err := datetime.IntervalFromObject(vm.Zone, obj); err == nil {
 			if v, perr := iv.GetProperty(vm.Zone, name); perr == nil {
@@ -2842,6 +2985,12 @@ func (vm *VM) dynamicPropGet(obj types.Value, name string) (types.Value, bool) {
 
 func (vm *VM) dynamicPropSet(obj types.Value, name string, val types.Value) bool {
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
+	if mysqliClass(classID) && classID != bytecode.ClassMysqliSqlException {
+		if err := mysqli.SetProperty(vm.Zone, obj, name, types.Deref(vm.Zone, val)); err != nil {
+			vm.raiseNativeError(err, name, nil, vm.line)
+		}
+		return true
+	}
 	if classID == bytecode.ClassDateInterval {
 		if iv, err := datetime.IntervalFromObject(vm.Zone, obj); err == nil {
 			if perr := iv.SetProperty(vm.Zone, name, val); perr == nil {
@@ -2928,6 +3077,15 @@ func (vm *VM) dynamicPropRef(obj types.Value, name string) (types.Value, bool) {
 
 func (vm *VM) dynamicPropQuery(op bytecode.Opcode, obj types.Value, name string) (bool, bool) {
 	classID := types.ObjectInfo(vm.Zone, obj).ClassID
+	if mysqliClass(classID) && classID != bytecode.ClassMysqliSqlException && op != bytecode.OpUnsetProp {
+		if v, ok := vm.mysqliPropGet(obj, name); ok {
+			defer vmRelease(vm.Zone, &v)
+			if op == bytecode.OpEmptyProp {
+				return !types.ToBoolZ(vm.Zone, v), true
+			}
+			return isSetValue(vm.Zone, v), true
+		}
+	}
 	if classID == bytecode.ClassDateInterval {
 		if iv, err := datetime.IntervalFromObject(vm.Zone, obj); err == nil {
 			if v, perr := iv.GetProperty(vm.Zone, name); perr == nil {
@@ -2960,7 +3118,7 @@ func (vm *VM) dynamicPropQuery(op bytecode.Opcode, obj types.Value, name string)
 			if op == bytecode.OpEmptyProp {
 				return !types.ToBoolZ(vm.Zone, v), true
 			}
-			return !types.Deref(vm.Zone, v).IsNull(), true
+			return isSetValue(vm.Zone, v), true
 		}
 	}
 	arr, hasDyn := pdo.ObjectDynamicArray(vm.Zone, obj)
@@ -2982,5 +3140,5 @@ func (vm *VM) dynamicPropQuery(op bytecode.Opcode, obj types.Value, name string)
 	if op == bytecode.OpEmptyProp {
 		return !types.ToBoolZ(vm.Zone, v), true
 	}
-	return !types.Deref(vm.Zone, v).IsNull(), true
+	return isSetValue(vm.Zone, v), true
 }

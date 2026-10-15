@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"code.hazyhaar.fr/devhoros/php127/bytecode"
 	"code.hazyhaar.fr/devhoros/php127/compiler"
 	"code.hazyhaar.fr/devhoros/php127/sapi"
 	"code.hazyhaar.fr/devhoros/php127/vm"
@@ -519,4 +521,166 @@ try {
 	}
 }
 
+// TestReprise7NamespaceQualifiedPrototypes vérifie que les déclarations portent le nom qualifié par leur espace de noms et que parents, interfaces, traits, catch, ::class et types sont résolus par les règles de PHP (nom complet, alias de use, préfixe namespace\, espace de noms courant).
+func TestReprise7NamespaceQualifiedPrototypes(t *testing.T) {
+	src := `<?php
+namespace WpOrg\Requests;
+use WpOrg\Requests\Exception\Http as HttpEx;
+use Countable, ArrayAccess as AA;
+interface Capability {}
+trait Helper {}
+abstract class Base implements Capability, AA, \Stringable {}
+class Requests extends Base implements Countable {
+	use Helper;
+	public function count(): int { return 0; }
+	public function make(?Requests $r, HttpEx|Base $h): self { return $this; }
+	public function offsetGet($o): mixed { return null; }
+	public function offsetSet($o, $v): void {}
+	public function offsetExists($o): bool { return false; }
+	public function offsetUnset($o): void {}
+	public function __toString(): string { return ''; }
+}
+function f() {
+	try { return [Requests::class, HttpEx::class, namespace\Base::class, \Exception::class]; } catch (HttpEx | Exception\Other $e) {}
+}
+namespace Other;
+class Requests extends \WpOrg\Requests\Requests {}
+`
+	prog, err := compiler.CompileSource(src, "ns.php")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]*bytecode.ClassProto{}
+	for _, list := range [][]*bytecode.ClassProto{prog.Classes, prog.Traits} {
+		for _, c := range list {
+			byName[c.Name] = c
+		}
+	}
+	want := func(name string) *bytecode.ClassProto {
+		t.Helper()
+		c := byName[name]
+		if c == nil {
+			names := make([]string, 0, len(byName))
+			for n := range byName {
+				names = append(names, n)
+			}
+			t.Fatalf("prototype %q absent ; prototypes : %q", name, names)
+		}
+		return c
+	}
+	if c := want(`WpOrg\Requests\Capability`); c.Kind != bytecode.KindInterface {
+		t.Fatalf("Capability : genre %v", c.Kind)
+	}
+	if c := want(`WpOrg\Requests\Helper`); c.Kind != bytecode.KindTrait {
+		t.Fatalf("Helper : genre %v", c.Kind)
+	}
+	base := want(`WpOrg\Requests\Base`)
+	if strings.Join(base.Interfaces, ",") != `WpOrg\Requests\Capability,ArrayAccess,Stringable` {
+		t.Fatalf("Base implements %q", base.Interfaces)
+	}
+	req := want(`WpOrg\Requests\Requests`)
+	if req.ParentName != `WpOrg\Requests\Base` || strings.Join(req.Interfaces, ",") != "Countable" || strings.Join(req.Traits, ",") != `WpOrg\Requests\Helper` {
+		t.Fatalf("Requests : parent %q interfaces %q traits %q", req.ParentName, req.Interfaces, req.Traits)
+	}
+	if other := want(`Other\Requests`); other.ParentName != `WpOrg\Requests\Requests` || other.ParentID != req.ID {
+		t.Fatalf("Other\\Requests : parent %q (%d) au lieu de %d", other.ParentName, other.ParentID, req.ID)
+	}
+	if _, short := byName["Requests"]; short {
+		t.Fatal("un prototype garde le nom court Requests")
+	}
+	for _, m := range req.Methods {
+		if m.Name != "make" {
+			continue
+		}
+		if got := m.Func.Params[0].TypeName + ";" + m.Func.Params[1].TypeName + ";" + m.Func.ReturnType; got != `WpOrg\Requests\Requests|null;WpOrg\Requests\Exception\Http|WpOrg\Requests\Base;self` {
+			t.Fatalf("types de make : %q", got)
+		}
+	}
+	var fn *bytecode.OpArray
+	for _, f := range prog.Funcs {
+		if f != nil && f.Name == "f" {
+			fn = f
+		}
+	}
+	if fn == nil {
+		t.Fatal("fonction f absente")
+	}
+	for _, text := range []string{`WpOrg\Requests\Requests`, `WpOrg\Requests\Exception\Http`, `WpOrg\Requests\Base`, `Exception`} {
+		if !slices.Contains(fn.Strings, text) {
+			t.Fatalf("::class %q absent des chaînes %q", text, fn.Strings)
+		}
+	}
+	var caught []string
+	for _, entry := range fn.TryTable {
+		for _, target := range entry.CatchTargets {
+			for _, id := range target.Classes {
+				for _, c := range prog.Classes {
+					if c.ID == id {
+						caught = append(caught, c.Name)
+					}
+				}
+			}
+		}
+	}
+	if strings.Join(caught, ",") != `WpOrg\Requests\Exception\Http,WpOrg\Requests\Exception\Other` {
+		t.Fatalf("catch résolus %q", caught)
+	}
+}
 
+// TestReprise7SilenceBracketsExpression vérifie que @expr est encadré par les deux marqueurs de silence, au plus près de l'expression.
+func TestReprise7SilenceBracketsExpression(t *testing.T) {
+	prog, err := compiler.CompileSource(`<?php $r = @include 'absent.php'; echo $r;`, "s.php")
+	if err != nil {
+		t.Fatal(err)
+	}
+	begin, include, end := -1, -1, -1
+	for i, in := range prog.Main.Code {
+		switch {
+		case in.Op == bytecode.OpNop && in.Flags&bytecode.FlagSilenceBegin != 0:
+			begin = i
+		case in.Op == bytecode.OpInclude:
+			include = i
+		case in.Op == bytecode.OpNop && in.Flags&bytecode.FlagSilenceEnd != 0:
+			end = i
+		}
+	}
+	if begin < 0 || include < 0 || end < 0 || !(begin < include && include < end) {
+		t.Fatalf("marqueurs de silence : début %d, include %d, fin %d", begin, include, end)
+	}
+}
+
+// TestReprise7NativeRefParams vérifie que les arguments par référence des natives et des méthodes mysqli ajoutées au lot 7 partent par OpSendRef.
+func TestReprise7NativeRefParams(t *testing.T) {
+	cases := []struct {
+		call string
+		refs int
+	}{
+		{`fsockopen('h', 1, $a, $b, 1.0)`, 2},
+		{`stream_socket_client('tcp://h:1', $a, $b, 1.0)`, 2},
+		{`flock($f, 2, $a)`, 1},
+		{`getimagesize('f.png', $a)`, 1},
+		{`getimagesizefromstring($s, $a)`, 1},
+		{`openssl_random_pseudo_bytes(8, $a)`, 1},
+		{`openssl_encrypt('d', 'aes-128-gcm', 'k', 0, 'iv', $a)`, 1},
+		{`mysqli_stmt_bind_param($st, 'sss', $a, $b, $c)`, 3},
+		{`mysqli_stmt_bind_result($st, $a, $b)`, 2},
+		{`$st->bind_param('ii', $a, $b)`, 2},
+		{`$st->bind_result($a, $b, $c)`, 3},
+		{`strlen($a)`, 0},
+	}
+	for _, tc := range cases {
+		prog, err := compiler.CompileSource("<?php "+tc.call+";", "r.php")
+		if err != nil {
+			t.Fatalf("%s : %v", tc.call, err)
+		}
+		refs := 0
+		for _, in := range prog.Main.Code {
+			if in.Op == bytecode.OpSendRef {
+				refs++
+			}
+		}
+		if refs != tc.refs {
+			t.Fatalf("%s : %d OpSendRef, attendu %d", tc.call, refs, tc.refs)
+		}
+	}
+}

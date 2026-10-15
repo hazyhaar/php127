@@ -40,7 +40,11 @@ func init() {
 }
 
 func resetProcessZoneLocked() {
-	processZone.Reset(nil)
+	if processZone.Capacity() != 256<<10 {
+		processZone = zone.New(256 << 10)
+	} else {
+		processZone.Reset(nil)
+	}
 	processZoneFrozen = false
 	processStrings = make(map[string]Value, len(archtimeInternedTable))
 	for _, entry := range archtimeInternedTable {
@@ -80,12 +84,25 @@ func ResetProcessZone() {
 	resetProcessZoneLocked()
 }
 
-// InternProcessString deduplicates literals before workers start. Construction
-// may allocate Go memory; exhaustion returns an error without publishing a value.
-// Calling it after freeze panics, including for an existing literal.
-func InternProcessString(text string) (Value, error) {
+// ReserveProcessZone étend la capacité de la zone de processus avant son gel tout en préservant les décalages existants.
+func ReserveProcessZone(capacity uint32) {
 	processZoneMu.Lock()
 	defer processZoneMu.Unlock()
+	if processZoneFrozen {
+		panic("types: process zone is frozen")
+	}
+	if capacity <= processZone.Capacity() {
+		return
+	}
+	processZone.Grow(capacity)
+	rebuilt := make(map[string]Value, len(processStrings))
+	for _, v := range processStrings {
+		rebuilt[StringData(nil, v)] = v
+	}
+	processStrings = rebuilt
+}
+
+func internProcessStringLocked(text string) (Value, error) {
 	if processZoneFrozen {
 		panic("types: process zone is frozen")
 	}
@@ -104,6 +121,104 @@ func InternProcessString(text string) (Value, error) {
 	// The key borrows the permanent immutable bytes, not the caller's storage.
 	processStrings[StringData(nil, v)] = v
 	return v, nil
+}
+
+// InternProcessString deduplicates literals before workers start. Construction
+// may allocate Go memory; exhaustion returns an error without publishing a value.
+// Calling it after freeze panics, including for an existing literal.
+func InternProcessString(text string) (Value, error) {
+	processZoneMu.Lock()
+	defer processZoneMu.Unlock()
+	return internProcessStringLocked(text)
+}
+
+// InternProcessValue promeut une valeur scalaire, une chaîne ou un tableau (et récursivement ses sous-tableaux et
+// clés) depuis src vers la zone de processus avant son gel. Un appel après FreezeProcessZone panique.
+func InternProcessValue(src *zone.Zone, v Value) (Value, error) {
+	processZoneMu.Lock()
+	defer processZoneMu.Unlock()
+	if processZoneFrozen {
+		panic("types: process zone is frozen")
+	}
+	return internProcessValueLocked(src, v)
+}
+
+func internProcessValueLocked(src *zone.Zone, v Value) (Value, error) {
+	v = Deref(src, v)
+	switch v.Type {
+	case TypeUndef, TypeNull, TypeFalse, TypeTrue, TypeLong, TypeDouble:
+		return v, nil
+	case TypeString:
+		if v.Flags&FlagZoneRequest == 0 {
+			return v, nil
+		}
+		return internProcessStringLocked(StringData(src, v))
+	case TypeArray:
+		if v.Flags&FlagZoneRequest == 0 {
+			return v, nil
+		}
+		srcH := arrayHeader(src, v)
+		srcBuckets, srcSlots := arrayData(src, srcH)
+		buckets := make([]Bucket, srcH.Cap)
+		for i := uint32(0); i < srcH.Used; i++ {
+			if srcBuckets[i].Val.IsUndef() {
+				continue
+			}
+			iv, err := internProcessValueLocked(src, srcBuckets[i].Val)
+			if err != nil {
+				return Value{}, err
+			}
+			var ik Value
+			if srcH.Kind == ArrayHash {
+				ik, err = internProcessValueLocked(src, srcBuckets[i].Key)
+				if err != nil {
+					return Value{}, err
+				}
+			}
+			buckets[i] = Bucket{
+				Val:  iv,
+				Key:  ik,
+				Hash: srcBuckets[i].Hash,
+				Next: srcBuckets[i].Next,
+			}
+		}
+		size, err := arrayDataSize(srcH.Kind, srcH.Cap)
+		if err != nil {
+			return Value{}, err
+		}
+		off, err := processZone.Alloc(arrayHeaderSize)
+		if err != nil {
+			return Value{}, err
+		}
+		dataOff, err := processZone.Alloc(size)
+		if err != nil {
+			_ = processZone.Free(off, arrayHeaderSize)
+			return Value{}, err
+		}
+		raw, err := processZone.Bytes(off, arrayHeaderSize)
+		if err != nil {
+			panic(err)
+		}
+		h := (*ArrayHeader)(unsafe.Pointer(unsafe.SliceData(raw)))
+		*h = ArrayHeader{
+			RefCount:   math.MaxUint32,
+			Kind:       srcH.Kind,
+			Flags:      0,
+			Len:        srcH.Len,
+			Used:       srcH.Used,
+			Cap:        srcH.Cap,
+			DataOffset: dataOff,
+			NextIdx:    srcH.NextIdx,
+		}
+		dstBuckets, dstSlots := arrayData(processZone, h)
+		copy(dstBuckets, buckets)
+		if srcH.Kind == ArrayHash {
+			copy(dstSlots, srcSlots)
+		}
+		return Value{Type: TypeArray, Flags: FlagImmutable | FlagInterned, DataSlot: off}, nil
+	default:
+		return Value{}, ErrArrayValue
+	}
 }
 
 // FreezeProcessZone permanently ends construction before request workers start.

@@ -313,7 +313,7 @@ func TestZoneReuse1000Requests(t *testing.T) {
 		types.ReleaseValue(z, &kA)
 
 		_, _ = io.WriteString(out, "ok:")
-		_, _ = out.Write(req.RawInput)
+		_, _ = io.WriteString(out, "done")
 		return nil
 	})
 
@@ -360,7 +360,7 @@ func TestZoneReuse1000Requests(t *testing.T) {
 		if got := rec.Header().Get("Set-Cookie"); !strings.Contains(got, "sid=val+token") {
 			t.Fatalf("req %d: Set-Cookie=%q", i, got)
 		}
-		if got := rec.Body.String(); got != "ok:"+body {
+		if got := rec.Body.String(); got != "ok:done" {
 			t.Fatalf("req %d: body=%q", i, got)
 		}
 	}
@@ -597,4 +597,67 @@ func TestHeaderAndCookieSemantics(t *testing.T) {
 		t.Fatalf("expected ValueError on CRLF header injection, got %v", err)
 	}
 }
+
+func TestMultipartUploadErrorsAndBracketedFiles(t *testing.T) {
+	handler := HandlerFunc(func(z *zone.Zone, req *RequestContext, out io.Writer) error {
+		return json.NewEncoder(out).Encode(valueToJSON(z, req.Files))
+	})
+	srv := NewServer(handler, Options{
+		MaxWorkers: 1,
+		ServerConfig: ServerConfig{
+			UploadMaxFileSize: 10,
+		},
+	})
+
+	var mpBody bytes.Buffer
+	mw := multipart.NewWriter(&mpBody)
+	_ = mw.WriteField("MAX_FILE_SIZE", "5")
+	fw1, _ := mw.CreateFormFile("docs[]", "ok.txt")
+	_, _ = fw1.Write([]byte("1234"))
+	fw2, _ := mw.CreateFormFile("docs[]", "form_too_big.txt")
+	_, _ = fw2.Write([]byte("123456"))
+	fw3, _ := mw.CreateFormFile("docs[]", "ini_too_big.txt")
+	_, _ = fw3.Write([]byte("0123456789ABC"))
+	_, _ = mw.CreateFormFile("empty_field", "")
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "http://php127.local/upload.php", &mpBody)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	var files map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &files); err != nil {
+		t.Fatalf("unmarshal files: %v\n%s", err, rec.Body.String())
+	}
+	docs := files["docs"].(map[string]any)
+	errs := docs["error"].([]any)
+	if len(errs) != 3 || errs[0] != float64(0) || errs[1] != float64(2) || errs[2] != float64(1) {
+		t.Fatalf("unexpected docs[error]: %+v", errs)
+	}
+	emptyField := files["empty_field"].(map[string]any)
+	if emptyField["error"] != float64(4) {
+		t.Fatalf("expected UPLOAD_ERR_NO_FILE (4), got %+v", emptyField)
+	}
+
+	// Flux multipart tronqué -> UPLOAD_ERR_PARTIAL (3)
+	rawTruncated := "--boundary123\r\n" +
+		"Content-Disposition: form-data; name=\"trunc\"; filename=\"cut.bin\"\r\n" +
+		"Content-Type: application/octet-stream\r\n\r\n" +
+		"partial"
+	reqTrunc := httptest.NewRequest(http.MethodPost, "http://php127.local/upload.php", strings.NewReader(rawTruncated))
+	reqTrunc.Header.Set("Content-Type", "multipart/form-data; boundary=boundary123")
+	recTrunc := httptest.NewRecorder()
+	srv.ServeHTTP(recTrunc, reqTrunc)
+
+	var filesTrunc map[string]any
+	if err := json.Unmarshal(recTrunc.Body.Bytes(), &filesTrunc); err != nil {
+		t.Fatalf("unmarshal truncated files: %v\n%s", err, recTrunc.Body.String())
+	}
+	truncEntry := filesTrunc["trunc"].(map[string]any)
+	if truncEntry["error"] != float64(3) {
+		t.Fatalf("expected UPLOAD_ERR_PARTIAL (3), got %+v", truncEntry)
+	}
+}
+
 

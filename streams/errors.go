@@ -53,6 +53,9 @@ func arity(name string, n, minN, maxN int) error {
 		return ArgumentCountError{sprintfCount(name, "at least", minN, n)}
 	}
 	if maxN >= 0 && n > maxN {
+		if minN == maxN {
+			return ArgumentCountError{sprintfCount(name, "exactly", maxN, n)}
+		}
 		return ArgumentCountError{sprintfCount(name, "at most", maxN, n)}
 	}
 	return nil
@@ -123,7 +126,9 @@ func castString(z *zone.Zone, v types.Value) (string, error) {
 		}
 		return strconv.FormatFloat(f, 'G', 14, 64), nil
 	case types.TypeString:
-		return types.StringData(z, v), nil
+		// Point d'entrée de toutes les chaînes reçues par le paquet : la copie empêche toute chaîne
+		// conservée (descripteur, contexte, chemin, erreur) de référencer l'arène de la Zone.
+		return strings.Clone(types.StringData(z, v)), nil
 	default:
 		return "", TypeError{"conversion en chaîne impossible"}
 	}

@@ -123,47 +123,75 @@ func strposNamed(z *zone.Zone, args []types.Value, name string, reverse bool) (t
 	if !ok {
 		return types.Value{}, ValueError{name + "(): Argument #3 ($offset) must be contained in argument #1 ($haystack)"}
 	}
+	if reverse {
+		return foundOrFalse(lastIndexFrom(hay, needle, off)), nil
+	}
 	if needle == "" {
-		if reverse {
-			return types.NewLong(int64(len(hay))), nil
-		}
 		return types.NewLong(int64(start)), nil
+	}
+	if start > len(hay) {
+		return types.NewBool(false), nil
 	}
 	hb := unsafe.Slice(unsafe.StringData(hay), len(hay))
 	nb := unsafe.Slice(unsafe.StringData(needle), len(needle))
-	if !reverse {
-		if start > len(hay) {
-			return types.NewBool(false), nil
-		}
-		rel := C2_strpos(hb[start:], uint64(len(hay)-start), nb, uint64(len(nb)))
-		if rel < 0 {
-			return types.NewBool(false), nil
-		}
-		return types.NewLong(int64(start) + rel), nil
-	}
-	if off < 0 {
-		limit := min(start+1, len(hay))
-		found := int64(-1)
-		for i := 0; i < limit; i++ {
-			if i+len(nb) <= len(hay) && hay[i:i+len(nb)] == needle {
-				found = int64(i)
-			}
-		}
-		if found < 0 {
-			return types.NewBool(false), nil
-		}
-		return types.NewLong(found), nil
-	}
-	found := int64(-1)
-	for i := start; i+len(nb) <= len(hay); i++ {
-		if hay[i:i+len(nb)] == needle {
-			found = int64(i)
-		}
-	}
-	if found < 0 {
+	rel := C2_strpos(hb[start:], uint64(len(hay)-start), nb, uint64(len(nb)))
+	if rel < 0 {
 		return types.NewBool(false), nil
 	}
-	return types.NewLong(found), nil
+	return types.NewLong(int64(start) + rel), nil
+}
+
+// lastIndexFrom transpose zend_memnrstr sur la fenêtre que strrpos et strripos dérivent de off, déjà
+// validé par offsetIn : off positif ouvre la fenêtre à off ; off négatif la ferme de sorte que
+// l'occurrence commence au plus tard à len(hay)+off. Une aiguille vide rend la fin de la fenêtre.
+// Retourne -1 sans occurrence.
+func lastIndexFrom(hay, needle string, off int64) int64 {
+	lo, hi := 0, len(hay)
+	if off >= 0 {
+		lo = int(off)
+	} else if int(-off) >= len(needle) {
+		hi = len(hay) + int(off) + len(needle)
+	}
+	if len(needle) > hi-lo {
+		return -1
+	}
+	i := strings.LastIndex(hay[lo:hi], needle)
+	if i < 0 {
+		return -1
+	}
+	return int64(lo + i)
+}
+
+func foundOrFalse(i int64) types.Value {
+	if i < 0 {
+		return types.NewBool(false)
+	}
+	return types.NewLong(i)
+}
+
+func nativeStrripos(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("strripos", len(args), 2, 3); err != nil {
+		return types.Value{}, err
+	}
+	hay, err := asStringParam(z, args[0], "strripos", "1", "haystack")
+	if err != nil {
+		return types.Value{}, err
+	}
+	needle, err := asStringParam(z, args[1], "strripos", "2", "needle")
+	if err != nil {
+		return types.Value{}, err
+	}
+	off := int64(0)
+	if len(args) == 3 {
+		off, err = asIntParam(z, args[2], "strripos", "3", "offset")
+		if err != nil {
+			return types.Value{}, err
+		}
+	}
+	if _, ok := offsetIn(len(hay), off); !ok {
+		return types.Value{}, ValueError{"strripos(): Argument #3 ($offset) must be contained in argument #1 ($haystack)"}
+	}
+	return foundOrFalse(lastIndexFrom(asciiLowerString(hay), asciiLowerString(needle), off)), nil
 }
 
 func nativeContains(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
@@ -499,53 +527,67 @@ func nativeReplace(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, 
 	search := deref(z, args[0])
 	repl := deref(z, args[1])
 	subj := deref(z, args[2])
+	var count int64
 	if subj.Type == types.TypeArray {
-		return replaceArray(z, search, repl, subj)
+		out, err := replaceArray(z, search, repl, subj, &count)
+		if err == nil {
+			storeReplaceCount(z, args, count)
+		}
+		return out, err
 	}
 	s, err := asStringParam(z, subj, "str_replace", "3", "subject")
 	if err != nil {
 		return types.Value{}, err
 	}
-	out, err := replaceString(z, search, repl, s)
+	out, err := replaceString(z, search, repl, s, &count)
 	if err != nil {
 		return types.Value{}, err
 	}
+	storeReplaceCount(z, args, count)
 	return newStr(z, out)
 }
 
-func replaceArray(z *zone.Zone, search, repl, subj types.Value) (types.Value, error) {
+// storeReplaceCount écrit le nombre de remplacements dans le quatrième argument de str_replace ou str_ireplace, transmis par référence.
+func storeReplaceCount(z *zone.Zone, args []types.Value, count int64) {
+	if len(args) >= 4 && args[3].Type == types.TypeReference {
+		types.AssignRef(z, args[3], types.NewLong(count))
+	}
+}
+
+func replaceArray(z *zone.Zone, search, repl, subj types.Value, count *int64) (types.Value, error) {
 	out, err := newArray(z)
 	if err != nil {
 		return types.Value{}, err
 	}
 	keys, vals := arrayItems(z, subj)
 	for i := range vals {
-		val := deref(z, vals[i])
-		var next types.Value
-		if val.Type == types.TypeArray {
-			next, err = replaceArray(z, search, repl, val)
-		} else {
-			s, e := castString(z, val)
-			if e != nil {
-				return types.Value{}, e
-			}
-			rep, e := replaceString(z, search, repl, s)
-			if e != nil {
-				return types.Value{}, e
-			}
-			next, err = newStr(z, rep)
-		}
+		// Comme php_str_replace_in_subject, un élément tableau est converti en "Array" puis remplacé, sans descente.
+		s, err := castString(z, vals[i])
 		if err != nil {
+			types.ReleaseValue(z, &out)
 			return types.Value{}, err
 		}
-		if err = setKey(z, &out, keys[i], next); err != nil {
+		rep, err := replaceString(z, search, repl, s, count)
+		if err != nil {
+			types.ReleaseValue(z, &out)
+			return types.Value{}, err
+		}
+		next, err := newStr(z, rep)
+		if err != nil {
+			types.ReleaseValue(z, &out)
+			return types.Value{}, err
+		}
+		err = setKey(z, &out, keys[i], next)
+		types.ReleaseValue(z, &next)
+		if err != nil {
+			types.ReleaseValue(z, &out)
 			return types.Value{}, err
 		}
 	}
 	return out, nil
 }
 
-func replaceString(z *zone.Zone, search, repl types.Value, subject string) (string, error) {
+func replaceString(z *zone.Zone, search, repl types.Value, subject string, count *int64) (string, error) {
 	if search.Type == types.TypeArray {
 		sk, sv := arrayItems(z, search)
 		_ = sk
@@ -575,6 +617,7 @@ func replaceString(z *zone.Zone, search, repl types.Value, subject string) (stri
 			if ss == "" {
 				continue
 			}
+			*count += int64(strings.Count(subject, ss))
 			subject = strings.ReplaceAll(subject, ss, rs)
 		}
 		return subject, nil
@@ -590,6 +633,7 @@ func replaceString(z *zone.Zone, search, repl types.Value, subject string) (stri
 	if ss == "" {
 		return subject, nil
 	}
+	*count += int64(strings.Count(subject, ss))
 	return strings.ReplaceAll(subject, ss, rs), nil
 }
 
@@ -791,6 +835,23 @@ func phpSprintf(z *zone.Zone, format string, args []types.Value) (string, error)
 			continue
 		}
 		i++
+		argnum := -1
+		if j := i; j < len(format) && format[j] >= '0' && format[j] <= '9' {
+			n := 0
+			for j < len(format) && format[j] >= '0' && format[j] <= '9' {
+				if n < 1<<31 {
+					n = n*10 + int(format[j]-'0')
+				}
+				j++
+			}
+			if j < len(format) && format[j] == '$' {
+				if n <= 0 || n >= 1<<31-1 {
+					return "", ValueError{"Argument number specifier must be greater than zero and less than 2147483647"}
+				}
+				argnum = n - 1
+				i = j + 1
+			}
+		}
 		left, plus, space, zero := false, false, false, false
 		customFill := byte(0)
 		hasCustomFill := false
@@ -839,14 +900,18 @@ func phpSprintf(z *zone.Zone, format string, args []types.Value) (string, error)
 			break
 		}
 		spec := format[i]
-		if ai >= len(args) {
-			return "", ArgumentCountError{"sprintf(): Argument #" + itoa(ai+2) + " is missing"}
+		cur := argnum
+		if cur < 0 {
+			cur = ai
+			ai++
 		}
-		piece, err := formatSpec(z, spec, args[ai], prec, plus, space)
+		if cur >= len(args) {
+			return "", ArgumentCountError{"sprintf(): Argument #" + itoa(cur+2) + " is missing"}
+		}
+		piece, err := formatSpec(z, spec, args[cur], prec, plus, space)
 		if err != nil {
 			return "", err
 		}
-		ai++
 		b.WriteString(padPiece(piece, width, left, zero && !left, hasCustomFill, customFill, spec))
 	}
 	return b.String(), nil
@@ -998,4 +1063,331 @@ func floatFromLoose(z *zone.Zone, v types.Value) float64 {
 	default:
 		return 0
 	}
+}
+
+// taintOf retourne le bit FlagTainted porté par v, par la valeur qu'il référence ou par l'en-tête de
+// la chaîne ; zéro hors chaîne.
+func taintOf(z *zone.Zone, v types.Value) types.Flags {
+	d := deref(z, v)
+	if d.Type != types.TypeString {
+		return 0
+	}
+	return (v.Flags | d.Flags | types.Flags(types.StringInfo(z, d).Flags)) & types.FlagTainted
+}
+
+// withTaint reporte sur la chaîne rendue out le marquage de l'argument src.
+func withTaint(z *zone.Zone, src, out types.Value, err error) (types.Value, error) {
+	if err == nil && out.Type == types.TypeString {
+		out.Flags |= taintOf(z, src)
+	}
+	return out, err
+}
+
+// chop est l'alias de rtrim ; le marquage de l'argument est reporté sur le résultat.
+func nativeChop(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	out, err := trimNamed(z, args, "chop", false, true)
+	if err != nil {
+		return types.Value{}, err
+	}
+	return withTaint(z, args[0], out, nil)
+}
+
+func nativeCountChars(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("count_chars", len(args), 1, 2); err != nil {
+		return types.Value{}, err
+	}
+	s, err := asStringParam(z, args[0], "count_chars", "1", "string")
+	if err != nil {
+		return types.Value{}, err
+	}
+	mode := int64(0)
+	if len(args) == 2 {
+		mode, err = asIntParam(z, args[1], "count_chars", "2", "mode")
+		if err != nil {
+			return types.Value{}, err
+		}
+	}
+	if mode < 0 || mode > 4 {
+		return types.Value{}, ValueError{"count_chars(): Argument #2 ($mode) must be between 0 and 4 (inclusive)"}
+	}
+	var counts [256]int64
+	for i := 0; i < len(s); i++ {
+		counts[s[i]]++
+	}
+	if mode >= 3 {
+		buf := make([]byte, 0, 256)
+		for c := range 256 {
+			if (counts[c] > 0) == (mode == 3) {
+				buf = append(buf, byte(c))
+			}
+		}
+		out, err := newBytes(z, buf)
+		return withTaint(z, args[0], out, err)
+	}
+	arr, err := newArray(z)
+	if err != nil {
+		return types.Value{}, err
+	}
+	for c := range 256 {
+		if mode == 1 && counts[c] == 0 || mode == 2 && counts[c] != 0 {
+			continue
+		}
+		if err := setKey(z, &arr, types.NewLong(int64(c)), types.NewLong(counts[c])); err != nil {
+			types.ReleaseValue(z, &arr)
+			return types.Value{}, err
+		}
+	}
+	return arr, nil
+}
+
+func hexDigit(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// byteAt rend s[i], ou l'octet nul terminal des chaînes C au-delà de la fin.
+func byteAt(s string, i int) byte {
+	if i < len(s) {
+		return s[i]
+	}
+	return 0
+}
+
+// nativeQuotedPrintableDecode transpose PHP_FUNCTION(quoted_printable_decode) de ext/standard/quot_print.c
+// (PHP 8.3) : la lecture s'arrête au premier octet nul, « =XX » hexadécimal est décodé, « = » suivi
+// d'espaces ou tabulations puis d'une fin de ligne (CRLF, CR, LF ou fin de chaîne) est un saut doux.
+func nativeQuotedPrintableDecode(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("quoted_printable_decode", len(args), 1, 1); err != nil {
+		return types.Value{}, err
+	}
+	s, err := asStringParam(z, args[0], "quoted_printable_decode", "1", "string")
+	if err != nil {
+		return types.Value{}, err
+	}
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c != '=' {
+			out = append(out, c)
+			i++
+			continue
+		}
+		hi, okHi := hexDigit(byteAt(s, i+1))
+		lo, okLo := hexDigit(byteAt(s, i+2))
+		if okHi && okLo {
+			out = append(out, hi<<4|lo)
+			i += 3
+			continue
+		}
+		k := 1
+		for byteAt(s, i+k) == ' ' || byteAt(s, i+k) == '\t' {
+			k++
+		}
+		switch next := byteAt(s, i+k); {
+		case next == 0:
+			i += k
+		case next == '\r' && byteAt(s, i+k+1) == '\n':
+			i += k + 2
+		case next == '\r' || next == '\n':
+			i += k + 1
+		default:
+			out = append(out, c)
+			i++
+		}
+	}
+	res, err := newBytes(z, out)
+	return withTaint(z, args[0], res, err)
+}
+
+// qprintMaxLine est PHP_QPRINT_MAXL : longueur au-delà de laquelle un saut doux « =\r\n » est inséré.
+const qprintMaxLine = 75
+
+// nativeQuotedPrintableEncode transpose php_quot_print_encode (PHP 8.3) : CRLF conservé, octets de
+// contrôle, non ASCII, « = » et espace précédant CR encodés « =XX », saut doux avant dépassement de
+// qprintMaxLine sans couper une séquence UTF-8 annoncée par son octet de tête.
+func nativeQuotedPrintableEncode(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("quoted_printable_encode", len(args), 1, 1); err != nil {
+		return types.Value{}, err
+	}
+	s, err := asStringParam(z, args[0], "quoted_printable_encode", "1", "string")
+	if err != nil {
+		return types.Value{}, err
+	}
+	const hexUpper = "0123456789ABCDEF"
+	out := make([]byte, 0, len(s)+len(s)/2)
+	lp := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\r' && byteAt(s, i+1) == '\n' {
+			out = append(out, '\r', '\n')
+			i++
+			lp = 0
+			continue
+		}
+		if c < 0x20 || c == 0x7f || c&0x80 != 0 || c == '=' || c == ' ' && byteAt(s, i+1) == '\r' {
+			lp += 3
+			if lp > qprintMaxLine && c <= 0x7f ||
+				c > 0x7f && c <= 0xdf && lp+3 > qprintMaxLine ||
+				c > 0xdf && c <= 0xef && lp+6 > qprintMaxLine ||
+				c > 0xef && c <= 0xf4 && lp+9 > qprintMaxLine {
+				out = append(out, '=', '\r', '\n')
+				lp = 3
+			}
+			out = append(out, '=', hexUpper[c>>4], hexUpper[c&0xf])
+			continue
+		}
+		lp++
+		if lp > qprintMaxLine {
+			out = append(out, '=', '\r', '\n')
+			lp = 1
+		}
+		out = append(out, c)
+	}
+	res, err := newBytes(z, out)
+	return withTaint(z, args[0], res, err)
+}
+
+// glibcMblen transpose mblen(3) de la glibc sous la locale C.UTF-8 que PHP 8.3 installe au démarrage
+// quel que soit l'environnement : séquences de un à six octets jusqu'à 0x7FFFFFFF, formes non
+// minimales et demi-codets UTF-16 refusés. Retourne la longueur de la séquence en tête de s non vide,
+// ou -1 si elle est invalide ou tronquée.
+func glibcMblen(s string) int {
+	c := s[0]
+	n, r := 0, uint32(0)
+	switch {
+	case c < 0x80:
+		return 1
+	case c < 0xc2:
+		return -1
+	case c < 0xe0:
+		n, r = 2, uint32(c&0x1f)
+	case c < 0xf0:
+		n, r = 3, uint32(c&0x0f)
+	case c < 0xf8:
+		n, r = 4, uint32(c&0x07)
+	case c < 0xfc:
+		n, r = 5, uint32(c&0x03)
+	case c < 0xfe:
+		n, r = 6, uint32(c&0x01)
+	default:
+		return -1
+	}
+	if len(s) < n {
+		return -1
+	}
+	for i := 1; i < n; i++ {
+		if s[i]&0xc0 != 0x80 {
+			return -1
+		}
+		r = r<<6 | uint32(s[i]&0x3f)
+	}
+	if r < [...]uint32{2: 0x80, 3: 0x800, 4: 0x10000, 5: 0x200000, 6: 0x4000000}[n] || r >= 0xd800 && r <= 0xdfff {
+		return -1
+	}
+	return n
+}
+
+func noNullBytes(s, fn, idx, param string) error {
+	if strings.IndexByte(s, 0) >= 0 {
+		return ValueError{fn + "(): Argument #" + idx + " ($" + param + ") must not contain any null bytes"}
+	}
+	return nil
+}
+
+// nativeEscapeshellarg transpose php_escape_shell_arg (PHP 8.3, Unix) : la chaîne est entourée
+// d'apostrophes, chaque apostrophe devient apostrophe, barre oblique inverse, apostrophe, apostrophe ;
+// les séquences multioctets valides sont recopiées et les octets que glibcMblen refuse sont omis.
+func nativeEscapeshellarg(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("escapeshellarg", len(args), 1, 1); err != nil {
+		return types.Value{}, err
+	}
+	s, err := asStringParam(z, args[0], "escapeshellarg", "1", "arg")
+	if err != nil {
+		return types.Value{}, err
+	}
+	if err := noNullBytes(s, "escapeshellarg", "1", "arg"); err != nil {
+		return types.Value{}, err
+	}
+	out := make([]byte, 0, len(s)+2)
+	out = append(out, '\'')
+	for i := 0; i < len(s); {
+		switch n := glibcMblen(s[i:]); {
+		case n < 0:
+			i++
+		case n > 1:
+			out = append(out, s[i:i+n]...)
+			i += n
+		default:
+			if s[i] == '\'' {
+				out = append(out, '\'', '\\', '\'')
+			}
+			out = append(out, s[i])
+			i++
+		}
+	}
+	out = append(out, '\'')
+	res, err := newBytes(z, out)
+	return withTaint(z, args[0], res, err)
+}
+
+// nativeEscapeshellcmd transpose php_escape_shell_cmd (PHP 8.3, Unix) : les métacaractères du shell
+// et le saut de ligne sont précédés d'une barre oblique inverse, un guillemet ou une apostrophe n'est
+// laissé intact que s'il est apparié plus loin dans la chaîne ; les séquences multioctets valides sont
+// recopiées et les octets que glibcMblen refuse sont omis (0xFF, échappé par la table C, est toujours omis).
+func nativeEscapeshellcmd(z *zone.Zone, _ io.Writer, args []types.Value) (types.Value, error) {
+	if err := arity("escapeshellcmd", len(args), 1, 1); err != nil {
+		return types.Value{}, err
+	}
+	s, err := asStringParam(z, args[0], "escapeshellcmd", "1", "command")
+	if err != nil {
+		return types.Value{}, err
+	}
+	if err := noNullBytes(s, "escapeshellcmd", "1", "command"); err != nil {
+		return types.Value{}, err
+	}
+	out := make([]byte, 0, 2*len(s))
+	pending := -1 // position du guillemet fermant attendu, -1 sans guillemet ouvert
+	for i := 0; i < len(s); {
+		n := glibcMblen(s[i:])
+		if n < 0 {
+			i++
+			continue
+		}
+		if n > 1 {
+			out = append(out, s[i:i+n]...)
+			i += n
+			continue
+		}
+		c := s[i]
+		switch c {
+		case '"', '\'':
+			if pending < 0 {
+				if j := strings.IndexByte(s[i+1:], c); j >= 0 {
+					pending = i + 1 + j
+				} else {
+					out = append(out, '\\')
+				}
+			} else if s[pending] == c {
+				pending = -1
+			} else {
+				out = append(out, '\\')
+			}
+		case '#', '&', ';', '`', '|', '*', '?', '~', '<', '>', '^', '(', ')', '[', ']', '{', '}', '$', '\\', '\n':
+			out = append(out, '\\')
+		}
+		out = append(out, c)
+		i++
+	}
+	res, err := newBytes(z, out)
+	return withTaint(z, args[0], res, err)
 }

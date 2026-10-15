@@ -1108,3 +1108,39 @@ func TestNormalizeArrayKeyAndArrayKeySameFastPaths(t *testing.T) {
 	ReleaseString(z, &k1)
 }
 
+func TestArrayResourceElementsAndSeparateEmpty(t *testing.T) {
+	z := zone.New(8192)
+	a := arrayValue(t, z)
+	res := Value{Type: TypeResource, Flags: FlagZoneRequest, Extra: 1, DataSlot: 42, Scalar: 42}
+	if err := ArrayAppend(z, &a, res); err != nil {
+		t.Fatalf("ArrayAppend(TypeResource): %v", err)
+	}
+	if err := ArraySet(z, &a, byteTable['s'], res, nil); err != nil {
+		t.Fatalf("ArraySet(TypeResource): %v", err)
+	}
+	got0, ok, err := ArrayGet(z, a, NewLong(0), nil)
+	if err != nil || !ok || got0 != res {
+		t.Fatalf("ArrayGet(0) = %+v, %v, %v", got0, ok, err)
+	}
+	gotS, ok, err := ArrayGet(z, a, byteTable['s'], nil)
+	if err != nil || !ok || gotS != res {
+		t.Fatalf("ArrayGet('s') = %+v, %v, %v", gotS, ok, err)
+	}
+	if !ToBoolZ(z, res) {
+		t.Fatal("ToBoolZ(TypeResource) = false; want true")
+	}
+	ReleaseArray(z, &a)
+
+	emptyA := arrayValue(t, z)
+	emptyB := RetainArray(z, emptyA)
+	if err := SeparateArray(z, &emptyB); err != nil {
+		t.Fatalf("SeparateArray(empty): %v", err)
+	}
+	if emptyA.DataSlot == emptyB.DataSlot || ArrayInfo(z, emptyA).RefCount != 1 || ArrayInfo(z, emptyB).RefCount != 1 {
+		t.Fatalf("empty shared array not separated: a=%+v b=%+v", ArrayInfo(z, emptyA), ArrayInfo(z, emptyB))
+	}
+	ReleaseArray(z, &emptyA)
+	ReleaseArray(z, &emptyB)
+}
+
+

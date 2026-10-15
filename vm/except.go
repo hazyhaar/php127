@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"code.hazyhaar.fr/devhoros/php127/bytecode"
+	"code.hazyhaar.fr/devhoros/php127/stdlib"
 	"code.hazyhaar.fr/devhoros/php127/types"
 )
 
@@ -28,6 +29,9 @@ func (vm *VM) fatalFeature(name string) {
 	b.WriteString(" on line ")
 	b.WriteString(strconv.FormatUint(uint64(vm.line), 10))
 	b.WriteByte('\n')
+	if vm.Zone != nil {
+		stdlib.RecordError(vm.Zone, eError, "fonctionnalité absente: "+name, vm.file(), int64(vm.line))
+	}
 	_, _ = vm.Out.Write([]byte(b.String()))
 	vm.exit = 255
 	vm.stop = true
@@ -152,6 +156,7 @@ func (vm *VM) doReturn(val types.Value) {
 		types.ReleaseValue(vm.Zone, &val)
 		vm.stop = true
 		vm.exit = 0
+		vm.mainReturned = true
 		return
 	}
 	depth := len(vm.frames)
@@ -402,13 +407,21 @@ func (vm *VM) uncaught(obj types.Value) {
 		types.ReleaseValue(vm.Zone, &obj)
 		return
 	}
-	_, _ = vm.Out.Write([]byte(vm.formatUncaught(obj)))
+	text, file, line := vm.formatUncaught(obj)
+	if vm.Zone != nil {
+		// error_get_last() d'une fonction d'arrêt rend, comme PHP, le texte affiché sans son préfixe ni son lieu final.
+		msg := strings.TrimPrefix(text, "\nFatal error: ")
+		msg = strings.TrimSuffix(msg, " in "+file+" on line "+strconv.FormatInt(line, 10)+"\n")
+		stdlib.RecordError(vm.Zone, eError, msg, file, line)
+	}
+	_, _ = vm.Out.Write([]byte(text))
 	types.ReleaseValue(vm.Zone, &obj)
 	vm.exit = 255
 	vm.stop = true
 }
 
-func (vm *VM) formatUncaught(obj types.Value) string {
+// formatUncaught rend le texte affiché pour une exception non interceptée, avec le fichier et la ligne de sa levée.
+func (vm *VM) formatUncaught(obj types.Value) (string, string, int64) {
 	d := types.Deref(vm.Zone, obj)
 	name := "Exception"
 	msg := ""
@@ -466,7 +479,7 @@ func (vm *VM) formatUncaught(obj types.Value) string {
 	b.WriteString(" on line ")
 	b.WriteString(strconv.FormatInt(line, 10))
 	b.WriteByte('\n')
-	return b.String()
+	return b.String(), file, line
 }
 
 type traceItem struct {
