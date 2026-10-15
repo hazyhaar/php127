@@ -504,14 +504,6 @@ func nativeMBCheckEncoding(z *zone.Zone, _ io.Writer, args []types.Value) (types
 // Les fonctions de configuration conservent leur valeur dans l'état de la Zone (extState, wp_ext.go),
 // remis aux valeurs par défaut de PHP par z.Reset.
 
-func validMBEncoding(name string) bool {
-	if _, ok := resolveEncoding(name); ok {
-		return true
-	}
-	_, ok := lookupCharset(name)
-	return ok
-}
-
 // mbInternalNames et mbRegexNames donnent le nom canonique rendu par mb_internal_encoding() et
 // mb_regex_encoding() pour chaque nom accepté, mesurés sur PHP 8.3.6 (mbstring.so) ; un nom absent est refusé.
 var mbInternalNames = map[string]string{

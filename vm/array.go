@@ -21,10 +21,6 @@ func (vm *VM) validStringOffsetForIsset(kd types.Value) (int64, bool) {
 	return 0, false
 }
 
-func (vm *VM) currentLoc() (string, uint32) {
-	return vm.file(), vm.line
-}
-
 func (vm *VM) typeNameForDiag(v types.Value) string {
 	return scalarOffsetTypeName(v.Type)
 }

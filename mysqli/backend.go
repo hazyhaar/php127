@@ -199,19 +199,6 @@ const (
 	charsetLatin1  = 8
 )
 
-func charsetNumber(name string) uint16 {
-	switch strings.ToLower(name) {
-	case "utf8", "utf8mb3":
-		return charsetUTF8
-	case "latin1":
-		return charsetLatin1
-	case "binary":
-		return charsetBinary
-	default:
-		return charsetUTF8MB4
-	}
-}
-
 func isNumericType(t uint8) bool {
 	switch t {
 	case typeDecimal, typeTiny, typeShort, typeLong, typeFloat, typeDouble,
