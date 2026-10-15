@@ -1,0 +1,7 @@
+bin/
+*.work
+*.manifest.json
+*.err
+*.log
+*~
+.~lock.*

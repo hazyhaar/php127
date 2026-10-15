@@ -1,209 +1,201 @@
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-// php127/cmd/php127: Binaire CLI canonique et serveur HTTP embarqué
-
+// php127 execute le bytecode issu du compilateur PHP.
 package main
 
 import (
-	"bufio"
-	"flag"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"code.hazyhaar.fr/devhoros/php127/compiler"
-	"code.hazyhaar.fr/devhoros/php127/httpgateway"
-	"code.hazyhaar.fr/devhoros/php127/security"
+	"code.hazyhaar.fr/devhoros/php127/parser"
+	"code.hazyhaar.fr/devhoros/php127/sapi"
 	"code.hazyhaar.fr/devhoros/php127/vm"
+	"code.hazyhaar.fr/devhoros/php127/zone"
 )
 
-const Version = "php127 v1.0.0 (Flatstack127 Go runtime PHP 8.4-compatible, Sovereign Zero-Alloc Edition)"
+func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
-func main() {
-	evalCode := flag.String("r", "", "Évalue directement le code PHP en paramètre")
-	replMode := flag.Bool("a", false, "Lance le mode interactif REPL")
-	serverAddr := flag.String("S", "", "Lance un serveur HTTP embarqué sur l'adresse spécifiée (ex: :8080)")
-	auditMode := flag.Bool("audit", false, "Active le mode de sécurité Audit (non-bloquant)")
-	showVer := flag.Bool("v", false, "Affiche les informations de version")
-	flag.BoolVar(showVer, "version", false, "Affiche les informations de version")
-
-	flag.Parse()
-
-	if *showVer {
-		fmt.Println(Version)
-		return
-	}
-
-	secMode := security.ModeEnforce
-	if *auditMode {
-		secMode = security.ModeAudit
-	}
-
-	// 1. Commande Reverse-Proxy Shield
-	if len(os.Args) > 1 && os.Args[1] == "shield" {
-		shieldFlags := flag.NewFlagSet("shield", flag.ExitOnError)
-		listenAddr := shieldFlags.String("listen", ":8080", "Port d'écoute du bouclier RASP")
-		backendURL := shieldFlags.String("backend", "http://127.0.0.1:9000", "URL du backend PHP-FPM / HTTP amont")
-		presetName := shieldFlags.String("preset", "generic", "Preset de sécurité (wordpress, laravel, symfony, prestashop, generic)")
-		enforceFlag := shieldFlags.Bool("enforce", false, "Active le blocage strict (défaut: mode audit non-bloquant)")
-		_ = shieldFlags.Parse(os.Args[2:])
-
-		sMode := security.ModeAudit
-		if *enforceFlag {
-			sMode = security.ModeEnforce
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitCode int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(stdout, "\nFatal error: internal error: %v\n", r)
+			exitCode = 255
 		}
-
-		ps, err := httpgateway.NewProxyShieldWithPreset(*backendURL, sMode, httpgateway.PresetType(*presetName))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Erreur initialisation ProxyShield: %v\n", err)
-			os.Exit(1)
+	}()
+	lint := false
+	showVersion := false
+	raw := ""
+	hasRaw := false
+	filename := ""
+	serverAddr := ""
+	docRoot := ""
+	var directives []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-n":
+		case arg == "-l":
+			lint = true
+		case arg == "-v", arg == "--version":
+			showVersion = true
+		case arg == "-r":
+			if i+1 == len(args) {
+				fmt.Fprintln(stderr, "Error in argument 1, char 2: option requires an argument r")
+				return 1
+			}
+			i++
+			raw = args[i]
+			hasRaw = true
+		case arg == "-S":
+			if i+1 == len(args) {
+				fmt.Fprintln(stderr, "Error in argument 1, char 2: option requires an argument S")
+				return 1
+			}
+			i++
+			serverAddr = args[i]
+		case arg == "-t":
+			if i+1 == len(args) {
+				fmt.Fprintln(stderr, "Error in argument 1, char 2: option requires an argument t")
+				return 1
+			}
+			i++
+			docRoot = args[i]
+		case arg == "-d":
+			if i+1 == len(args) {
+				fmt.Fprintln(stderr, "Error in argument 1, char 2: option requires an argument d")
+				return 1
+			}
+			i++
+			directives = append(directives, args[i])
+		case strings.HasPrefix(arg, "-d"):
+			directives = append(directives, strings.TrimPrefix(arg, "-d"))
+		case arg == "--":
+			if i+1 < len(args) {
+				filename = args[i+1]
+			}
+			i = len(args)
+		case strings.HasPrefix(arg, "-"):
+			fmt.Fprintf(stderr, "Unknown option: %s\n", arg)
+			return 1
+		default:
+			filename = arg
+			i = len(args)
 		}
-
-		fmt.Printf(" [php127 RASP Shield] En écoute sur http://%s -> %s (Preset: %s | Mode: %v)\n", *listenAddr, *backendURL, *presetName, sMode)
-		if err := http.ListenAndServe(*listenAddr, ps); err != nil {
-			fmt.Fprintf(os.Stderr, "Erreur serveur: %v\n", err)
-			os.Exit(1)
-		}
-		return
 	}
-
-	// 2. Commande d'installation de l'Agent Drop-in
-	if len(os.Args) > 1 && os.Args[1] == "install-agent" {
-		agentFlags := flag.NewFlagSet("install-agent", flag.ExitOnError)
-		targetFile := agentFlags.String("target", ".user.ini", "Fichier cible d'injection (.user.ini ou php.ini)")
-		_ = agentFlags.Parse(os.Args[2:])
-
-		cwd, _ := os.Getwd()
-		agentPath := cwd + "/agent/php127_rasp_agent.php"
-		content := fmt.Sprintf("; php127 In-Process RASP Agent Auto-Prepend\nauto_prepend_file = \"%s\"\n", agentPath)
-
-		err := os.WriteFile(*targetFile, []byte(content), 0644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Erreur écriture agent dans %s: %v\n", *targetFile, err)
-			os.Exit(1)
-		}
-		fmt.Printf(" [OK] Agent php127 configuré dans %s (auto_prepend_file = %s)\n", *targetFile, agentPath)
-		return
+	_ = directives
+	if showVersion {
+		fmt.Fprintln(stdout, "PHP 8.3.6 (cli) (php127 Go 1.27 Zero-GC Engine)")
+		return 0
 	}
-
-	// 3. Mode Évaluation en ligne -r
-	if *evalCode != "" {
-		executeSource(*evalCode, secMode)
-		return
-	}
-
-	// 4. Mode Serveur HTTP -S
-	if *serverAddr != "" {
-		var scriptContent string = "<?php echo 'php127 server active'; ?>"
-		args := flag.Args()
-		if len(args) > 0 {
-			b, err := os.ReadFile(args[0])
-			if err == nil {
-				scriptContent = string(b)
+	if serverAddr != "" {
+		if docRoot == "" {
+			if wd, err := os.Getwd(); err == nil {
+				docRoot = wd
+			} else {
+				docRoot = "."
 			}
 		}
-		gw, err := httpgateway.CompileAndServe(scriptContent, secMode)
+		srv, err := buildHTTPServer(serverAddr, docRoot, filename, stderr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Erreur compilation script serveur: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "php127: %v\n", err)
+			return 1
 		}
-		fmt.Printf("Démarrage du serveur php127 sur http://%s\n", *serverAddr)
-		if err := http.ListenAndServe(*serverAddr, gw); err != nil {
-			fmt.Fprintf(os.Stderr, "Erreur serveur: %v\n", err)
-			os.Exit(1)
+		if err := http.ListenAndServe(serverAddr, srv); err != nil {
+			fmt.Fprintf(stderr, "php127: %v\n", err)
+			return 1
 		}
-		return
+		return 0
 	}
-
-	// 5. Mode REPL Interactif -a
-	if *replMode {
-		runREPL(secMode)
-		return
-	}
-
-	// 6. Mode Fichier script
-	args := flag.Args()
-	if len(args) > 0 {
-		filePath := args[0]
-		b, err := os.ReadFile(filePath)
+	var src string
+	if hasRaw {
+		src = "<?php " + raw
+		filename = "Command line code"
+	} else if filename != "" {
+		data, err := os.ReadFile(filename)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Impossible d'ouvrir le fichier %s: %v\n", filePath, err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "Could not open input file: %s\n", filename)
+			return 1
 		}
-		executeSource(string(b), secMode)
-		return
+		src = string(data)
+		if !lint {
+			if abs, absErr := filepath.Abs(filename); absErr == nil {
+				filename = abs
+			}
+		}
+	} else {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			fmt.Fprintf(stderr, "php127: %v\n", err)
+			return 1
+		}
+		src = string(data)
+		filename = "Standard input code"
 	}
-
-	// Aide par défaut
-	fmt.Println(Version)
-	fmt.Println("\nUsage:")
-	fmt.Println("  php127 script.php                            Exécute un fichier de script PHP")
-	fmt.Println("  php127 -r \"code\"                             Évalue une ligne de code PHP")
-	fmt.Println("  php127 -a                                    Lance la console interactive REPL")
-	fmt.Println("  php127 -S 127.0.0.1:8080                     Lance le serveur HTTP in-process")
-	fmt.Println("  php127 shield --preset wordpress --listen :80  Lance le bouclier ProxyShield RASP")
-	fmt.Println("  php127 install-agent --target .user.ini      Génère la directive auto_prepend_file pour PHP-FPM")
+	if lint {
+		if err := parser.CheckSyntax(src, filename); err != nil {
+			fmt.Fprintf(stdout, "\n%s\nErrors parsing %s\n", err, filename)
+			return 255
+		}
+		fmt.Fprintf(stdout, "No syntax errors detected in %s\n", filename)
+		return 0
+	}
+	prog, err := compiler.CompileSource(src, filename)
+	if err != nil {
+		fmt.Fprintf(stdout, "\n%s\n", err)
+		return 255
+	}
+	return vm.Execute(zone.New(zone.DefaultCapacity), stdout, stderr, prog, vm.NewContext()) & 255
 }
 
-func executeSource(src string, mode security.SecurityMode) {
-	cleanSrc := strings.TrimSpace(src)
-	if strings.HasPrefix(cleanSrc, "<?php") {
-		cleanSrc = strings.TrimPrefix(cleanSrc, "<?php")
-	}
-	if strings.HasSuffix(cleanSrc, "?>") {
-		cleanSrc = strings.TrimSuffix(cleanSrc, "?>")
-	}
-
-	prog, err := compiler.Compile(cleanSrc)
+func buildHTTPServer(addr, docRoot, routerScript string, stderr io.Writer) (*sapi.Server, error) {
+	absRoot, err := filepath.Abs(docRoot)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Erreur de compilation: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
-
-	machine := vm.NewVM(os.Stdout)
-	machine.Guard.Mode = mode
-	_, err = machine.Execute(prog)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Erreur d'exécution: %v\n", err)
-		os.Exit(1)
+	srvName, srvPort := "localhost", "80"
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		if h != "" {
+			srvName = h
+		}
+		if p != "" {
+			srvPort = p
+		}
 	}
-}
-
-func runREPL(mode security.SecurityMode) {
-	fmt.Println(Version)
-	fmt.Println("Mode interactif actif. Tapez 'exit' ou 'quit' pour quitter.")
-	fmt.Println()
-
-	scanner := bufio.NewScanner(os.Stdin)
-	machine := vm.NewVM(os.Stdout)
-	machine.Guard.Mode = mode
-
-	for {
-		fmt.Print("php127 > ")
-		if !scanner.Scan() {
-			break
+	runner := sapi.HandlerFunc(func(z *zone.Zone, req *sapi.RequestContext, out io.Writer) error {
+		scriptPath := routerScript
+		if scriptPath == "" {
+			urlPath := "/index.php"
+			if req.Request != nil && req.Request.URL != nil && req.Request.URL.Path != "" && req.Request.URL.Path != "/" {
+				urlPath = req.Request.URL.Path
+			}
+			cleanRel := filepath.Clean(strings.TrimPrefix(urlPath, "/"))
+			scriptPath = filepath.Join(absRoot, cleanRel)
+			if st, err := os.Stat(scriptPath); err == nil && st.IsDir() {
+				scriptPath = filepath.Join(scriptPath, "index.php")
+			}
 		}
-		line := strings.TrimSpace(scanner.Text())
-		if line == "exit" || line == "quit" {
-			break
-		}
-		if line == "" {
-			continue
-		}
-
-		prog, err := compiler.Compile(line)
+		data, err := os.ReadFile(scriptPath)
 		if err != nil {
-			fmt.Printf("Erreur: %v\n", err)
-			continue
+			req.StatusCode = http.StatusNotFound
+			_, _ = io.WriteString(out, "Not Found")
+			return nil
 		}
-
-		res, err := machine.Execute(prog)
+		prog, err := compiler.CompileSource(string(data), scriptPath)
 		if err != nil {
-			fmt.Printf("Exception: %v\n", err)
-			continue
+			return err
 		}
-		if res.Type != 0 && res.Type != 1 { // Non-undef et non-null
-			fmt.Printf("=> %s\n", res.String())
-		}
-	}
+		vm.Execute(z, out, stderr, prog, vm.NewContext())
+		return nil
+	})
+	return sapi.NewServer(runner, sapi.Options{
+		ServerConfig: sapi.ServerConfig{
+			DocumentRoot: absRoot,
+			ServerName:   srvName,
+			ServerPort:   srvPort,
+		},
+	}), nil
 }

@@ -1,1901 +1,1394 @@
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-// php127/vm: Machine Virtuelle Flatstack127 à zéro allocation
-
 package vm
 
 import (
+	"bytes"
 	"fmt"
 	"io"
-	"sort"
-	"strings"
+	"slices"
+	"sync"
+	"sync/atomic"
 
-	"code.hazyhaar.fr/devhoros/php127/builtins"
-	"code.hazyhaar.fr/devhoros/php127/foreign"
+	"code.hazyhaar.fr/devhoros/php127/bytecode"
+	"code.hazyhaar.fr/devhoros/php127/datetime"
+	"code.hazyhaar.fr/devhoros/php127/fiber"
 	"code.hazyhaar.fr/devhoros/php127/pdo"
-	"code.hazyhaar.fr/devhoros/php127/security"
+	"code.hazyhaar.fr/devhoros/php127/reflection"
+	"code.hazyhaar.fr/devhoros/php127/sapi"
+	"code.hazyhaar.fr/devhoros/php127/session"
+	"code.hazyhaar.fr/devhoros/php127/spl"
 	"code.hazyhaar.fr/devhoros/php127/streams"
 	"code.hazyhaar.fr/devhoros/php127/types"
-	"github.com/hazyhaar/c2pkg/c2blueteam"
-	"github.com/hazyhaar/c2pkg/c2mem"
-	"github.com/hazyhaar/c2pkg/c2ordered_swiss"
-	"github.com/hazyhaar/c2pkg/c2pcre"
-	"github.com/hazyhaar/c2pkg/c2strsimd"
+	"code.hazyhaar.fr/devhoros/php127/zone"
 )
 
-type Opcode uint8
+const maxFrames = 8192
+
+type Context struct {
+	over              map[*bytecode.OpArray]map[int]bytecode.Opcode
+	strs              map[*bytecode.OpArray][]types.Value
+	BlockTaintedSinks bool
+	TaintedSinks      int
+}
+
+func NewContext() *Context { return &Context{} }
+
+func (c *Context) Specialize(fn *bytecode.OpArray, pc int, op bytecode.Opcode) {
+	if c == nil || fn == nil {
+		return
+	}
+	if c.over == nil {
+		c.over = make(map[*bytecode.OpArray]map[int]bytecode.Opcode)
+	}
+	m := c.over[fn]
+	if m == nil {
+		m = make(map[int]bytecode.Opcode)
+		c.over[fn] = m
+	}
+	m[pc] = op
+}
+
+func (c *Context) opcode(fn *bytecode.OpArray, pc int, fallback bytecode.Opcode) bytecode.Opcode {
+	if c == nil || c.over == nil {
+		return fallback
+	}
+	if m := c.over[fn]; m != nil {
+		if op, ok := m[pc]; ok {
+			return op
+		}
+	}
+	return fallback
+}
+
+type iterState struct {
+	gen     *generator
+	iterObj types.Value
+	keys    []types.Value
+	vals    []types.Value
+	index   int
+	arrayCV int
+	byRef   bool
+	active  bool
+}
 
 const (
-	OpNop Opcode = iota
-	OpLoadConst
-	OpLoadConstStr
-	OpLoadVar
-	OpStoreVar
-	OpDup
-	OpPop
-
-	// Arithmétique & Math
-	OpAdd
-	OpSub
-	OpMul
-	OpDiv
-	OpMod
-	OpPow
-	OpNeg
-	OpNot
-
-	// Comparaisons
-	OpEq
-	OpNotEq
-	OpIdentical
-	OpNotIdentical
-	OpLt
-	OpLte
-	OpGt
-	OpGte
-	OpSpaceship
-
-	// Bitwise & Décalages
-	OpBitAnd
-	OpBitOr
-	OpBitXor
-	OpBitNot
-	OpShiftLeft
-	OpShiftRight
-
-	// Chaînes & SIMD
-	OpConcat
-	OpStrLen
-	OpStrPos
-	OpSubstr
-
-	// Tableaux & Itération
-	OpArrayInit
-	OpArraySet
-	OpArrayGet
-	OpArrayPop
-	OpArrayLen
-	OpArrayIterInit
-	OpArrayIterNext
-
-	// Contrôle de flux
-	OpJmp
-	OpJmpZ
-	OpJmpNZ
-	OpSwitch
-
-	// Fonctions & Frames
-	OpCall
-	OpCallDynamic
-	OpRetFrame
-	OpGetArg
-	OpThrow
-
-	// Modèle Objet & Classes
-	OpNewObject
-	OpGetProp
-	OpSetProp
-	OpCallMethod
-	OpCallStatic
-	OpGetConst
-	OpInstanceOf
-
-	// Buffers de sortie SPL
-	OpObStart
-	OpObGetClean
-	OpObGetContents
-	OpObEndFlush
-
-	// Primitives Standard & Builtins
-	OpBuiltinCall
-
-	// Sécurité & BlueTeam
-	OpPregMatch
-	OpBlueteamEntropy
-	OpBlueteamClassify
-	OpSecurityCheck
-
-	// E/S & Retour
-	OpEcho
-	OpPrint
-	OpReturn
-
-	// Opérateur de silence @
-	OpSilenceBegin
-	OpSilenceEnd
+	contReturn = iota
+	contThrow
+	contJump
+	contExit
 )
 
-type Instruction struct {
-	Op    Opcode
-	A     uint16
-	B     uint16
-	C     uint16
-	Const types.Value
+type finState struct {
+	tryIndex int
+	kind     int
+	val      types.Value
+	target   int
+	origin   int
+	active   bool
 }
 
-type ClassDef struct {
-	Name         string
-	Parent       string
-	Implements   []string
-	Methods      map[string]uint16 // method name lowercase -> function index in BytecodeProgram.Functions
-	Constants    map[string]types.Value
-	PropNames    []string
-	PropOffsets  map[string]int
-	PropDefaults []types.Value
+type frame struct {
+	gen           *generator
+	fn            *bytecode.OpArray
+	pc            int
+	cvBase        int
+	evalBase      int
+	evalTop       int
+	span          int
+	calledClass   uint32
+	scopeClass    uint32
+	this          types.Value
+	hasThis       bool
+	inlineFrame   bool
+	callLine      uint32
+	iters         []iterState
+	fin           []finState
+	tryDepth      []int
+	pending       types.Value
+	hasPending    bool
+	dynamicLocals map[string]types.Value
+	args          []types.Value
 }
 
-type ExceptionHandler struct {
-	StartPC   int
-	EndPC     int
-	CatchPC   int
-	FinallyPC int
-	CatchType string
-	CatchVar  uint16
+type namedArg struct {
+	name string
+	val  types.Value
 }
 
-type BytecodeProgram struct {
-	Instructions      []Instruction
-	Constants         []types.Value
-	StringPool        []string
-	Functions         []BytecodeProgram
-	Classes           []ClassDef
-	ClassMap          map[string]uint16
-	ExceptionHandlers []ExceptionHandler
-	NumVars           uint16
-}
-
-type CallFrame struct {
-	ReturnPC      int
-	BaseSP        int
-	BaseVar       int
-	NumArgs       uint16
-	IsConstructor bool
-	Prog          *BytecodeProgram
-}
-
-type ObjectInstance struct {
-	ClassIdx  uint16
-	ClassName string
-	Props     []types.Value
-	PropsBuf  [32]types.Value
-}
-
-type FiberState uint8
+type callKind uint8
 
 const (
-	FiberInit FiberState = iota
-	FiberRunning
-	FiberSuspended
-	FiberTerminated
+	callFunc callKind = iota
+	callMethod
+	callStatic
+	callNew
+	callClosure
 )
 
-type FiberInstance struct {
-	State       FiberState
-	Callable    types.Value
-	SavedStack  []types.Value
-	SavedSP     int
-	SavedVars   []types.Value
-	SavedFrames []CallFrame
-	SavedFP     int
-	SavedProg   *BytecodeProgram
-	SavedPC     int
-	ReturnVal   types.Value
+type callSpec struct {
+	kind       callKind
+	funcIndex  int
+	icPC       int32
+	classID    uint32
+	method     string
+	obj        types.Value
+	hasObj     bool
+	pooledArgs bool
+	args       []types.Value
+	named      []namedArg
+	flags      uint16
+	line       uint32
+}
+
+type closureData struct {
+	fn   *bytecode.OpArray
+	uses []types.Value
+	live bool
 }
 
 type VM struct {
-	Stack         []types.Value
-	StackBuf      [1024]types.Value
-	SP            int
-	Vars          []types.Value
-	VarsBuf       [512]types.Value
-	Frames        []CallFrame
-	FramesBuf     [64]CallFrame
-	FP            int
-	Functions     []BytecodeProgram
-	Classes       []ClassDef
-	ClassMap      map[string]uint16
-	Objects       []ObjectInstance
-	ObjectsBuf    [128]ObjectInstance
-	NextObject    int
-	Fibers        map[int64]*FiberInstance
-	NextFiber     int64
-	CurrentFiber  int64
-	Arena         c2mem.C2_arena_t
-	ArenaBuf      [256 * 1024]byte
-	Cleanups      [64]c2mem.C2_cleanup_entry_t
-	SwissTables   [16]c2ordered_swiss.Swiss_table_t
-	SwissCtrl     [16][128]byte
-	SwissSlots    [16][128]uint32
-	SwissElems    [16][64]c2ordered_swiss.Swiss_element_t
-	SwissValues   [16][64]types.Value
-	NextTable     int
-	Output        io.Writer
-	FormatBuf     [128]byte
-	Guard         *security.Guard
-	OutputBuffers [][]byte
-	Streams       *streams.StreamManager
-	DB            *pdo.MemoryDB
-	SilenceLevel  int
-	ForeignPool   foreign.WorkerPool
+	Zone    *zone.Zone
+	Out     io.Writer
+	Err     io.Writer
+	Program *bytecode.Program
+	Context *Context
+
+	inUse         atomic.Bool
+	pooled        bool
+	sessionActive bool
+	lastOut       io.Writer
+	lastErr       io.Writer
+	defaultCtx    Context
+	mainStrs      []types.Value
+	reflProvider  vmReflectionProvider
+
+	slots    []types.Value
+	used     int
+	frames   []frame
+	pending  []callSpec
+	argPool  [][]types.Value
+	exit     int
+	stop     bool
+	control  bool
+	line     uint32
+	retVal   types.Value
+	hasRet   bool
+	thrown   types.Value
+	hasThrow bool
+	excTrace []traceItem
+
+	closures          []closureData
+	generators        []*generator
+	enums             map[uint32][]types.Value
+	statics           map[uint32][]types.Value
+	localStatics      map[*bytecode.OpArray]map[uint32]types.Value
+	globals           map[string]types.Value
+	constCache        map[string]types.Value
+	errorReporting    int64
+	included          map[string]bool
+	progCloned        bool
+	superglobalsInit  bool
+	lastProg          *bytecode.Program
+	propCaches        [][]bytecode.PropIC
+	callCaches        [][]bytecode.CallIC
+	fiberCallerStack  []fiberStackSnap
+	fiberSuspended    map[*fiber.Fiber]fiberStackSnap
+	fiberCallbacks    map[*fiber.Fiber]types.Value
+	magicGuard        map[magicKey]bool
+	obStack           []*bytes.Buffer
+	origOut           io.Writer
+	errorHandlers     []types.Value
+	exceptionHandlers []types.Value
+	autoloaders       []types.Value
+	arrayCursors      map[uint32]int
 }
 
-func NewVM(out io.Writer) *VM {
-	vm := &VM{
-		Output:  out,
-		Guard:   security.NewGuard(security.ModeEnforce),
-		Streams: streams.NewStreamManager(nil),
-		DB:      pdo.DefaultDB,
+type magicKey struct {
+	slot uint32
+	name string
+}
+
+func (vm *VM) resetInlineCachesIfProgramChanged() {
+	if vm.lastProg == vm.Program && !vm.progCloned {
+		return
 	}
-	vm.Reset()
+	vm.lastProg = vm.Program
+	for i := range vm.propCaches {
+		clear(vm.propCaches[i])
+		vm.propCaches[i] = vm.propCaches[i][:0]
+	}
+	for i := range vm.callCaches {
+		clear(vm.callCaches[i])
+		vm.callCaches[i] = vm.callCaches[i][:0]
+	}
+}
+
+func (vm *VM) propCache(fn *bytecode.OpArray) []bytecode.PropIC {
+	if fn == nil || fn.FuncID == 0 || int(fn.FuncID) >= len(vm.propCaches) {
+		return nil
+	}
+	return vm.propCaches[fn.FuncID]
+}
+
+func (vm *VM) ensurePropCache(fn *bytecode.OpArray) []bytecode.PropIC {
+	if fn == nil || fn.FuncID == 0 {
+		return nil
+	}
+	id := int(fn.FuncID)
+	if id >= len(vm.propCaches) {
+		next := make([][]bytecode.PropIC, max(id+1, len(vm.propCaches)*2, 8))
+		copy(next, vm.propCaches)
+		vm.propCaches = next
+	}
+	c := vm.propCaches[id]
+	if len(c) != len(fn.Code) {
+		if cap(c) >= len(fn.Code) {
+			c = c[:len(fn.Code)]
+			clear(c)
+		} else {
+			c = make([]bytecode.PropIC, len(fn.Code))
+		}
+		vm.propCaches[id] = c
+	}
+	return c
+}
+
+func (vm *VM) callCache(fn *bytecode.OpArray) []bytecode.CallIC {
+	if fn == nil || fn.FuncID == 0 || int(fn.FuncID) >= len(vm.callCaches) {
+		return nil
+	}
+	return vm.callCaches[fn.FuncID]
+}
+
+func (vm *VM) ensureCallCache(fn *bytecode.OpArray) []bytecode.CallIC {
+	if fn == nil || fn.FuncID == 0 {
+		return nil
+	}
+	id := int(fn.FuncID)
+	if id >= len(vm.callCaches) {
+		next := make([][]bytecode.CallIC, max(id+1, len(vm.callCaches)*2, 8))
+		copy(next, vm.callCaches)
+		vm.callCaches = next
+	}
+	c := vm.callCaches[id]
+	if len(c) != len(fn.Code) {
+		if cap(c) >= len(fn.Code) {
+			c = c[:len(fn.Code)]
+			clear(c)
+		} else {
+			c = make([]bytecode.CallIC, len(fn.Code))
+		}
+		vm.callCaches[id] = c
+	}
+	return c
+}
+
+var zoneVM sync.Map
+
+func init() {
+	types.SetObjectDestructor(func(z *zone.Zone, v types.Value) {
+		if raw, ok := zoneVM.Load(z); ok {
+			raw.(*VM).runDestructor(v)
+		}
+	})
+}
+
+func New(z *zone.Zone, stdout, stderr io.Writer, prog *bytecode.Program, ctx *Context) *VM {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	vm := &VM{
+		Zone: z, Out: stdout, Err: stderr, Program: prog,
+		slots:          make([]types.Value, 256),
+		frames:         make([]frame, 0, 32),
+		pending:        make([]callSpec, 0, 16),
+		globals:        make(map[string]types.Value, 8),
+		errorReporting: 32767,
+	}
+	if ctx == nil {
+		vm.Context = &vm.defaultCtx
+	} else {
+		vm.Context = ctx
+	}
 	return vm
 }
 
-func (vm *VM) Reset() {
-	vm.SP = 0
-	vm.FP = 0
-	vm.Stack = vm.StackBuf[:]
-	vm.Vars = vm.VarsBuf[:]
-	vm.Frames = vm.FramesBuf[:]
-	vm.Objects = vm.ObjectsBuf[:]
-	if vm.Fibers == nil {
-		vm.Fibers = make(map[int64]*FiberInstance)
-	} else {
-		for k := range vm.Fibers {
-			delete(vm.Fibers, k)
+func Execute(z *zone.Zone, stdout, stderr io.Writer, prog *bytecode.Program, ctx *Context) int {
+	if z != nil {
+		if raw, ok := zoneVM.Load(z); ok {
+			vm := raw.(*VM)
+			if vm.inUse.CompareAndSwap(false, true) {
+				if stdout == nil {
+					stdout = io.Discard
+				}
+				if stderr == nil {
+					stderr = io.Discard
+				}
+				vm.Out = stdout
+				vm.Err = stderr
+				vm.Program = prog
+				if ctx == nil {
+					vm.Context = &vm.defaultCtx
+				} else {
+					vm.Context = ctx
+				}
+				vm.exit = 0
+				vm.stop = false
+				vm.control = false
+				vm.errorReporting = 32767
+				vm.progCloned = false
+				vm.superglobalsInit = false
+				vm.sessionActive = false
+				return vm.executePooled()
+			}
+		}
+		vm := New(z, stdout, stderr, prog, ctx)
+		vm.pooled = true
+		vm.inUse.Store(true)
+		zoneVM.Store(z, vm)
+		return vm.executePooled()
+	}
+	return New(z, stdout, stderr, prog, ctx).Execute()
+}
+
+func (vm *VM) executePooled() (res int) {
+	defer func() {
+		if r := recover(); r != nil {
+			if vm.Out != nil {
+				_, _ = fmt.Fprintf(vm.Out, "\nFatal error: internal error: %v\n", r)
+			}
+			vm.stop = true
+			vm.exit = 255
+			res = 255
+		}
+		vm.inUse.Store(false)
+	}()
+	if vm.Program == nil || vm.Program.Main == nil {
+		vm.fatalFeature("programme")
+		return vm.exit
+	}
+	vm.resetInlineCachesIfProgramChanged()
+	if vm.Zone != nil {
+		if vm.Out != vm.lastOut {
+			streams.SetOutput(vm.Zone, vm.Out)
+			vm.lastOut = vm.Out
+		}
+		if vm.Err != vm.lastErr {
+			streams.SetStderr(vm.Zone, vm.Err)
+			vm.lastErr = vm.Err
 		}
 	}
-	vm.NextFiber = 1
-	vm.CurrentFiber = 0
-	if vm.Streams == nil {
-		vm.Streams = streams.NewStreamManager(nil)
+	if vm.Program.NeedsSuperglobals || !vm.Program.Main.CVMetaResolved {
+		vm.initSuperglobals()
+		vm.superglobalsInit = true
 	}
-	if vm.DB == nil {
-		vm.DB = pdo.DefaultDB
+	vm.invokeOpArray(vm.Program.Main, types.Value{}, false, nil, 0, 0, 0)
+	if !vm.stop {
+		vm.exit = 0
 	}
-	for i := range vm.Vars {
-		vm.Vars[i] = types.NewNull()
-	}
-	c2mem.C2_arena_init(&vm.Arena, vm.ArenaBuf[:], uint32(len(vm.ArenaBuf)), vm.Cleanups[:], uint32(len(vm.Cleanups)))
-	vm.NextTable = 0
-	vm.NextObject = 0
-	for i := range vm.Objects {
-		vm.Objects[i] = ObjectInstance{}
-	}
-	vm.OutputBuffers = vm.OutputBuffers[:0]
-	vm.SilenceLevel = 0
+	vm.finishRequest()
+	res = vm.exit
+	return res
 }
 
-func (vm *VM) Push(v types.Value) {
-	if vm.SP >= len(vm.Stack) {
-		newStack := make([]types.Value, len(vm.Stack)*2)
-		copy(newStack, vm.Stack)
-		vm.Stack = newStack
-	}
-	vm.Stack[vm.SP] = v
-	vm.SP++
-}
-
-func (vm *VM) Pop() types.Value {
-	if vm.SP > 0 {
-		vm.SP--
-		return vm.Stack[vm.SP]
-	}
-	return types.NewNull()
-}
-
-func (vm *VM) Peek() types.Value {
-	if vm.SP > 0 {
-		return vm.Stack[vm.SP-1]
-	}
-	return types.NewNull()
-}
-
-func (vm *VM) Execute(prog *BytecodeProgram) (types.Value, error) {
-	pc := 0
-	currentProg := prog
-	if len(prog.Functions) > 0 {
-		vm.Functions = prog.Functions
-	}
-	if len(prog.Classes) > 0 {
-		vm.Classes = prog.Classes
-		vm.ClassMap = prog.ClassMap
-	}
-
-	for {
-		if pc >= len(currentProg.Instructions) {
-			if vm.FP > 0 {
-				// Implicit return from function
-				vm.FP--
-				frame := vm.Frames[vm.FP]
-				pc = frame.ReturnPC
-				if frame.Prog != nil {
-					currentProg = frame.Prog
-				} else {
-					currentProg = prog
-				}
-				continue
+func (vm *VM) Execute() (res int) {
+	defer func() {
+		if r := recover(); r != nil {
+			if vm.Out != nil {
+				_, _ = fmt.Fprintf(vm.Out, "\nFatal error: internal error: %v\n", r)
 			}
-			break
+			vm.stop = true
+			vm.exit = 255
+			res = 255
 		}
-
-		ins := currentProg.Instructions[pc]
-		switch ins.Op {
-		case OpNop:
-			pc++
-
-		case OpLoadConst:
-			vm.Push(ins.Const)
-			pc++
-
-		case OpLoadConstStr:
-			if int(ins.A) < len(currentProg.StringPool) {
-				vm.Push(types.NewString(currentProg.StringPool[ins.A]))
+	}()
+	if vm.Program == nil || vm.Program.Main == nil {
+		vm.fatalFeature("programme")
+		return vm.exit
+	}
+	vm.resetInlineCachesIfProgramChanged()
+	if vm.Zone != nil {
+		if vm.Out != vm.lastOut {
+			streams.SetOutput(vm.Zone, vm.Out)
+			vm.lastOut = vm.Out
+		}
+		if vm.Err != vm.lastErr {
+			streams.SetStderr(vm.Zone, vm.Err)
+			vm.lastErr = vm.Err
+		}
+	}
+	var prev any
+	var hadPrev bool
+	if vm.Zone != nil {
+		prev, hadPrev = zoneVM.Swap(vm.Zone, vm)
+		defer func() {
+			if hadPrev {
+				zoneVM.Store(vm.Zone, prev)
 			} else {
-				vm.Push(types.NewString(""))
+				zoneVM.Delete(vm.Zone)
 			}
-			pc++
+		}()
+	}
+	if vm.Program.NeedsSuperglobals || !vm.Program.Main.CVMetaResolved {
+		vm.initSuperglobals()
+		vm.superglobalsInit = true
+	}
+	vm.invokeOpArray(vm.Program.Main, types.Value{}, false, nil, 0, 0, 0)
+	if !vm.stop {
+		vm.exit = 0
+	}
+	vm.finishRequest()
+	return vm.exit
+}
 
-		case OpLoadVar:
-			base := 0
-			if vm.FP > 0 {
-				base = vm.Frames[vm.FP-1].BaseVar
+func (vm *VM) runZoneCleanups() {
+	vm.Zone.RunCleanups(func(item zone.CleanupItem) {
+		fiber.DispatchCleanup(vm.Zone, item)
+		spl.DispatchCleanup(vm.Zone, item)
+		datetime.DispatchCleanup(vm.Zone, item)
+		reflection.DispatchCleanup(vm.Zone, item)
+		session.DispatchCleanup(vm.Zone, item)
+		streams.DispatchCleanup(item)
+		pdo.DispatchCleanup(item)
+		types.DispatchObjectDestructor(vm.Zone, item)
+	})
+}
+
+func (vm *VM) finishRequest() {
+	if vm.Zone == nil {
+		return
+	}
+	vm.stop = false
+	vm.control = false
+	if vm.progCloned {
+		vm.lastProg = nil
+	}
+	vm.syncSessionBeforeClose()
+	if len(vm.fiberCallbacks) > 0 || len(vm.fiberSuspended) > 0 || len(vm.fiberCallerStack) > 0 {
+		for f, obj := range vm.fiberCallbacks {
+			v := obj
+			types.ReleaseValue(vm.Zone, &v)
+			delete(vm.fiberCallbacks, f)
+		}
+		for f, snap := range vm.fiberSuspended {
+			vm.releaseStackSnap(&snap)
+			delete(vm.fiberSuspended, f)
+		}
+		for i := range vm.fiberCallerStack {
+			vm.releaseStackSnap(&vm.fiberCallerStack[i])
+		}
+		vm.fiberCallerStack = nil
+		fiber.CleanupZone(vm.Zone)
+	}
+	if vm.Zone.PendingCleanups() > 0 {
+		vm.runZoneCleanups()
+	}
+	if vm.superglobalsInit || vm.Program == nil || vm.Program.NeedsSuperglobals || !vm.Program.Main.CVMetaResolved {
+		sapi.BindContext(vm.Zone, nil)
+	}
+	vm.superglobalsInit = false
+	for len(vm.frames) > 0 {
+		vm.releaseFrameValues()
+		if len(vm.frames) > 0 {
+			fr := vm.frames[len(vm.frames)-1]
+			clear(vm.slots[fr.cvBase : fr.cvBase+fr.span])
+			vm.popFrame()
+		}
+	}
+	if len(vm.pending) > 0 {
+		for _, sp := range vm.pending {
+			vm.releaseArgs(sp.args)
+			vm.releaseSpecObj(sp)
+		}
+		vm.pending = vm.pending[:0]
+	}
+	if vm.hasRet {
+		vmRelease(vm.Zone, &vm.retVal)
+		vm.hasRet = false
+	}
+	if vm.hasThrow {
+		vmRelease(vm.Zone, &vm.thrown)
+		vm.hasThrow = false
+	}
+	vm.excTrace = nil
+	if len(vm.statics) > 0 {
+		for id, slots := range vm.statics {
+			for i := range slots {
+				types.ReleaseValue(vm.Zone, &slots[i])
 			}
-			slot := base + int(ins.A)
-			if slot < len(vm.Vars) {
-				vm.Push(vm.Vars[slot])
-			} else {
-				vm.Push(types.NewNull())
+			delete(vm.statics, id)
+		}
+	}
+	if len(vm.enums) > 0 {
+		for id, cases := range vm.enums {
+			vm.releaseArgs(cases)
+			delete(vm.enums, id)
+		}
+	}
+	if len(vm.localStatics) > 0 {
+		for fn, values := range vm.localStatics {
+			for idx, v := range values {
+				types.ReleaseValue(vm.Zone, &v)
+				delete(values, idx)
 			}
-			pc++
-
-		case OpStoreVar:
-			val := vm.Pop()
-			base := 0
-			if vm.FP > 0 {
-				base = vm.Frames[vm.FP-1].BaseVar
+			delete(vm.localStatics, fn)
+		}
+	}
+	if len(vm.globals) > 0 {
+		for name, v := range vm.globals {
+			val := v
+			types.ReleaseValue(vm.Zone, &val)
+			delete(vm.globals, name)
+		}
+	}
+	if len(vm.constCache) > 0 {
+		for name, v := range vm.constCache {
+			val := v
+			types.ReleaseValue(vm.Zone, &val)
+			delete(vm.constCache, name)
+		}
+	}
+	if len(vm.mainStrs) > 0 {
+		for i := range vm.mainStrs {
+			if vm.mainStrs[i].Type != types.TypeUndef {
+				types.ReleaseValue(vm.Zone, &vm.mainStrs[i])
 			}
-			slot := base + int(ins.A)
-			if slot < len(vm.Vars) {
-				vm.Vars[slot] = val
-			}
-			pc++
-
-		case OpDup:
-			vm.Push(vm.Peek())
-			pc++
-
-		case OpPop:
-			_ = vm.Pop()
-			pc++
-
-		// Arithmétique & Math
-		case OpAdd:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.Add(a, b))
-			pc++
-
-		case OpSub:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.Sub(a, b))
-			pc++
-
-		case OpMul:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.Mul(a, b))
-			pc++
-
-		case OpDiv:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.Div(a, b))
-			pc++
-
-		case OpMod:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.Mod(a, b))
-			pc++
-
-		case OpPow:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.Pow(a, b))
-			pc++
-
-		case OpNeg:
-			a := vm.Pop()
-			vm.Push(types.Neg(a))
-			pc++
-
-		case OpNot:
-			a := vm.Pop()
-			vm.Push(types.Not(a))
-			pc++
-
-		// Comparaisons
-		case OpEq:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(types.Equal(a, b)))
-			pc++
-
-		case OpNotEq:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(!types.Equal(a, b)))
-			pc++
-
-		case OpIdentical:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(types.Identical(a, b)))
-			pc++
-
-		case OpNotIdentical:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(!types.Identical(a, b)))
-			pc++
-
-		case OpLt:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(types.Lt(a, b)))
-			pc++
-
-		case OpLte:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(types.Lte(a, b)))
-			pc++
-
-		case OpGt:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(types.Gt(a, b)))
-			pc++
-
-		case OpGte:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewBool(types.Gte(a, b)))
-			pc++
-
-		case OpSpaceship:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.NewLong(int64(types.Compare(a, b))))
-			pc++
-
-		// Bitwise
-		case OpBitAnd:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.BitAnd(a, b))
-			pc++
-
-		case OpBitOr:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.BitOr(a, b))
-			pc++
-
-		case OpBitXor:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.BitXor(a, b))
-			pc++
-
-		case OpBitNot:
-			a := vm.Pop()
-			vm.Push(types.BitNot(a))
-			pc++
-
-		case OpShiftLeft:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.ShiftLeft(a, b))
-			pc++
-
-		case OpShiftRight:
-			b := vm.Pop()
-			a := vm.Pop()
-			vm.Push(types.ShiftRight(a, b))
-			pc++
-
-		// Chaînes
-		case OpConcat:
-			b := vm.Pop()
-			a := vm.Pop()
-			aBytes := a.ToStringBuffered(vm.FormatBuf[:])
-			aLen := len(aBytes)
-			// Copy aBytes to temp buffer so b.ToStringBuffered does not overwrite if using FormatBuf
-			var tempA [64]byte
-			if aLen <= len(tempA) {
-				copy(tempA[:], aBytes)
-				aBytes = tempA[:aLen]
-			} else {
-				aBytes = append([]byte(nil), aBytes...)
-			}
-			bBytes := b.ToStringBuffered(vm.FormatBuf[:])
-			bLen := len(bBytes)
-			totalLen := uint32(aLen + bLen)
-
-			offset := c2mem.C2_arena_alloc(&vm.Arena, totalLen)
-			var resVal types.Value
-			if offset >= 0 && offset+int(totalLen) <= len(vm.ArenaBuf) {
-				copy(vm.ArenaBuf[offset:], aBytes)
-				copy(vm.ArenaBuf[offset+aLen:], bBytes)
-				resVal = types.NewStringBytes(vm.ArenaBuf[offset : offset+int(totalLen)])
-			} else {
-				res := make([]byte, totalLen)
-				copy(res, aBytes)
-				copy(res[aLen:], bBytes)
-				resVal = types.NewStringBytes(res)
-			}
-			vm.Push(resVal.CombineTaint(a, b))
-			pc++
-
-		case OpStrLen:
-			a := vm.Pop()
-			if a.Type == types.TypeString {
-				b := a.Bytes()
-				ulen := c2strsimd.C2_mb_strlen_utf8(b, uint64(len(b)))
-				vm.Push(types.NewLong(int64(ulen)))
-			} else {
-				vm.Push(types.NewLong(0))
-			}
-			pc++
-
-		case OpStrPos:
-			needle := vm.Pop()
-			haystack := vm.Pop()
-			pos := haystack.Pos(needle)
-			if pos >= 0 {
-				vm.Push(types.NewLong(pos))
-			} else {
-				vm.Push(types.NewBool(false))
-			}
-			pc++
-
-		case OpSubstr:
-			length := vm.Pop().ToLong()
-			start := vm.Pop().ToLong()
-			str := vm.Pop()
-			vm.Push(types.Substr(str, start, length))
-			pc++
-
-		// Tableaux
-		case OpArrayInit:
-			if vm.NextTable < len(vm.SwissTables) {
-				tIdx := vm.NextTable
-				vm.NextTable++
-				ht := &vm.SwissTables[tIdx]
-				c2ordered_swiss.Swiss_init(
-					ht,
-					vm.SwissCtrl[tIdx][:],
-					vm.SwissSlots[tIdx][:],
-					vm.SwissElems[tIdx][:],
-					64,
-					64,
-				)
-				val := types.Value{
-					Type: types.TypeArray,
-					Data: int64(tIdx),
+		}
+		vm.mainStrs = vm.mainStrs[:0]
+	}
+	if vm.Context != nil && len(vm.Context.strs) > 0 {
+		for fn, cache := range vm.Context.strs {
+			for i := range cache {
+				if cache[i].Type != types.TypeUndef {
+					types.ReleaseValue(vm.Zone, &cache[i])
 				}
-				vm.Push(val)
-			} else {
-				vm.Push(types.NewNull())
 			}
-			pc++
+			vm.Context.strs[fn] = cache[:0]
+		}
+	}
+	if len(vm.closures) > 0 {
+		for i := range vm.closures {
+			vm.releaseClosure(i)
+		}
+		vm.closures = vm.closures[:0]
+	}
+	if len(vm.generators) > 0 {
+		for _, g := range vm.generators {
+			vm.releaseGenerator(g)
+		}
+		vm.generators = vm.generators[:0]
+	}
+	if len(vm.included) > 0 {
+		clear(vm.included)
+	}
+	if len(vm.magicGuard) > 0 {
+		clear(vm.magicGuard)
+	}
+	if len(vm.arrayCursors) > 0 {
+		clear(vm.arrayCursors)
+	}
+	if len(vm.obStack) > 0 {
+		if vm.origOut != nil {
+			for _, v := range slices.Backward(vm.obStack) {
+				_, _ = vm.origOut.Write(v.Bytes())
+			}
+			vm.Out = vm.origOut
+			vm.origOut = nil
+		}
+		vm.obStack = nil
+	}
+	for i := range vm.errorHandlers {
+		vmRelease(vm.Zone, &vm.errorHandlers[i])
+	}
+	vm.errorHandlers = nil
+	for i := range vm.exceptionHandlers {
+		vmRelease(vm.Zone, &vm.exceptionHandlers[i])
+	}
+	vm.exceptionHandlers = nil
+	for i := range vm.autoloaders {
+		vmRelease(vm.Zone, &vm.autoloaders[i])
+	}
+	vm.autoloaders = nil
+}
 
-		case OpArraySet:
-			val := vm.Pop()
-			key := vm.Pop()
-			arr := vm.Pop()
-			if arr.Type == types.TypeArray && int(arr.Data) < len(vm.SwissTables) {
-				tIdx := int(arr.Data)
-				ht := &vm.SwissTables[tIdx]
-				k := key.ToLong()
-				if c2ordered_swiss.Swiss_insert_packed_int(ht, k, uint32(val.Type), k) {
-					if k >= 0 && k < 64 {
-						vm.SwissValues[tIdx][k] = val
+func (vm *VM) frame() *frame {
+	return &vm.frames[len(vm.frames)-1]
+}
+
+func (vm *VM) pushFastFrame(fn *bytecode.OpArray, called, scope uint32, this types.Value, hasThis bool, callLine uint32, inline bool) bool {
+	if len(vm.frames) >= maxFrames {
+		vm.fatalFeature("profondeur d'appel")
+		return false
+	}
+	ncv := fn.NumCVs
+	span := ncv + fn.MaxStack
+	if vm.used+span > len(vm.slots) {
+		capNeeded := max(vm.used+span, max(len(vm.slots)*2, 64))
+		next := make([]types.Value, capNeeded)
+		copy(next, vm.slots[:vm.used])
+		vm.slots = next
+	}
+	base := vm.used
+	vm.used += span
+	clear(vm.slots[base : base+span])
+	var tryDepth []int
+	if len(fn.TryTable) > 0 {
+		tryDepth = make([]int, len(fn.TryTable))
+		for i := range tryDepth {
+			tryDepth[i] = -1
+		}
+	}
+	vm.frames = append(vm.frames, frame{
+		fn: fn, pc: 0, cvBase: base, evalBase: base + ncv, evalTop: base + ncv, span: span,
+		calledClass: called, scopeClass: scope, this: this, hasThis: hasThis, inlineFrame: inline, callLine: callLine,
+		tryDepth: tryDepth,
+	})
+	return true
+}
+
+func (vm *VM) pushFrame(fn *bytecode.OpArray, called, scope uint32, this types.Value, hasThis bool, callLine uint32) bool {
+	if fn == nil {
+		vm.fatalFeature("fonction")
+		return false
+	}
+	if len(vm.frames) >= maxFrames {
+		vm.fatalFeature("profondeur d'appel")
+		return false
+	}
+	ncv := max(fn.NumCVs, 0)
+	ms := max(fn.MaxStack, 0)
+	span := ncv + ms
+	if vm.used+span > len(vm.slots) {
+		capNeeded := max(vm.used+span, max(len(vm.slots)*2, 64))
+		next := make([]types.Value, capNeeded)
+		copy(next, vm.slots[:vm.used])
+		vm.slots = next
+	}
+	base := vm.used
+	vm.used += span
+	clear(vm.slots[base : base+span])
+	var tryDepth []int
+	if len(fn.TryTable) > 0 {
+		tryDepth = make([]int, len(fn.TryTable))
+		for i := range tryDepth {
+			tryDepth[i] = -1
+		}
+	}
+	if len(fn.SuperglobalCVs) > 0 {
+		for _, idx := range fn.SuperglobalCVs {
+			if int(idx) < len(fn.CVNames) {
+				ref := vm.superglobalRef(fn.CVNames[idx])
+				if ref.Type == types.TypeReference {
+					vm.slots[base+int(idx)] = types.RetainReference(vm.Zone, ref)
+				}
+			}
+		}
+	} else if !fn.CVMetaResolved && len(fn.CVNames) > 0 {
+		for i, name := range fn.CVNames {
+			if isSuperglobal(name) {
+				ref := vm.superglobalRef(name)
+				if ref.Type == types.TypeReference {
+					vm.slots[base+i] = types.RetainReference(vm.Zone, ref)
+				}
+			}
+		}
+	}
+	fr := frame{
+		fn: fn, pc: 0, cvBase: base, evalBase: base + ncv, evalTop: base + ncv, span: span,
+		calledClass: called, scopeClass: scope, this: this, hasThis: hasThis, callLine: callLine,
+		tryDepth: tryDepth,
+	}
+	vm.frames = append(vm.frames, fr)
+	return true
+}
+
+func (vm *VM) popFrame() {
+	if len(vm.frames) == 0 {
+		return
+	}
+	fr := vm.frames[len(vm.frames)-1]
+	if vm.used == fr.cvBase+fr.span {
+		vm.used = fr.cvBase
+	}
+	vm.frames = vm.frames[:len(vm.frames)-1]
+	vm.checkSlotsAfterPop(fr.cvBase, fr.span)
+}
+
+func (vm *VM) releaseFrameValues() {
+	if len(vm.frames) == 0 {
+		return
+	}
+	frameIdx := len(vm.frames) - 1
+	if len(vm.frames[frameIdx].dynamicLocals) > 0 {
+		locals := vm.frames[frameIdx].dynamicLocals
+		vm.frames[frameIdx].dynamicLocals = nil
+		for name, v := range locals {
+			delete(locals, name)
+			vmRelease(vm.Zone, &v)
+			if vm.stop || vm.hasThrow || len(vm.frames) <= frameIdx {
+				return
+			}
+		}
+	}
+	if len(vm.frames[frameIdx].args) > 0 {
+		args := vm.frames[frameIdx].args
+		vm.frames[frameIdx].args = nil
+		vm.releaseArgs(args)
+		if vm.stop || vm.hasThrow || len(vm.frames) <= frameIdx {
+			return
+		}
+	}
+	for vm.frames[frameIdx].evalTop > vm.frames[frameIdx].evalBase {
+		vm.frames[frameIdx].evalTop--
+		idx := vm.frames[frameIdx].evalTop
+		old := vm.slots[idx]
+		vm.slots[idx] = types.Value{}
+		if old.Type > types.TypeDouble && old.Type != types.TypeResource {
+			types.ReleaseValue(vm.Zone, &old)
+			if vm.stop || vm.hasThrow || len(vm.frames) <= frameIdx {
+				return
+			}
+		}
+	}
+	for i := 0; i < len(vm.frames[frameIdx].iters); i++ {
+		it := vm.frames[frameIdx].iters[i]
+		vm.frames[frameIdx].iters[i] = iterState{}
+		vm.freeIter(&it)
+		if vm.stop || vm.hasThrow || len(vm.frames) <= frameIdx {
+			return
+		}
+	}
+	cvBase := vm.frames[frameIdx].cvBase
+	ncv := vm.frames[frameIdx].fn.NumCVs
+	for i := range ncv {
+		old := vm.slots[cvBase+i]
+		vm.slots[cvBase+i] = types.Value{}
+		if old.Type > types.TypeDouble && old.Type != types.TypeResource {
+			types.ReleaseValue(vm.Zone, &old)
+			if vm.stop || vm.hasThrow || len(vm.frames) <= frameIdx {
+				return
+			}
+		}
+	}
+	for i := 0; i < len(vm.frames[frameIdx].fin); i++ {
+		old := vm.frames[frameIdx].fin[i].val
+		vm.frames[frameIdx].fin[i].val = types.Value{}
+		vmRelease(vm.Zone, &old)
+		if vm.stop || vm.hasThrow || len(vm.frames) <= frameIdx {
+			return
+		}
+	}
+	if vm.frames[frameIdx].hasPending {
+		old := vm.frames[frameIdx].pending
+		vm.frames[frameIdx].pending = types.Value{}
+		vm.frames[frameIdx].hasPending = false
+		vmRelease(vm.Zone, &old)
+	}
+}
+
+func (vm *VM) push(v types.Value) {
+	fr := vm.frame()
+	if fr.evalTop >= fr.evalBase+fr.fn.MaxStack {
+		vm.fatalFeature("dépassement de pile")
+		vmRelease(vm.Zone, &v)
+		return
+	}
+	vm.slots[fr.evalTop] = v
+	fr.evalTop++
+}
+
+func (vm *VM) pop() types.Value {
+	fr := vm.frame()
+	if fr.evalTop <= fr.evalBase {
+		vm.fatalFeature("sous-dépassement de pile")
+		return types.NewUndef()
+	}
+	fr.evalTop--
+	v := vm.slots[fr.evalTop]
+	vm.slots[fr.evalTop] = types.Value{}
+	return v
+}
+
+func (vm *VM) cvPtr(idx uint32) *types.Value {
+	fr := vm.frame()
+	return &vm.slots[fr.cvBase+int(idx)]
+}
+
+func (vm *VM) bump() {
+	if vm.stop || vm.control || len(vm.frames) == 0 {
+		return
+	}
+	vm.frame().pc++
+}
+
+func (vm *VM) execFrames(base int) {
+	for len(vm.frames) > base && !vm.stop {
+		vm.control = false
+		fr := &vm.frames[len(vm.frames)-1]
+		if fr.pc < 0 || fr.pc >= len(fr.fn.Code) {
+			vm.fatalFeature("compteur ordinal hors code")
+			return
+		}
+		if len(fr.fn.TryTable) > 0 {
+			vm.noteTry(fr.pc)
+		}
+		in := fr.fn.Code[fr.pc]
+		vm.line = in.Line
+		op := in.Op
+		hasOver := vm.Context != nil && len(vm.Context.over) > 0
+		if hasOver {
+			op = vm.Context.opcode(fr.fn, fr.pc, op)
+		}
+		switch op {
+		case bytecode.OpLoadCV:
+			if in.Flags == 0 && !fr.fn.HasDynamicCV && (!fr.fn.HasGlobalsCV || in.Op1 != fr.fn.GlobalsCV) && fr.fn.CVMetaResolved {
+				slot := vm.slots[fr.cvBase+int(in.Op1)]
+				if (slot.Type == types.TypeLong || slot.Type == types.TypeDouble) && !hasOver && len(fr.fn.TryTable) == 0 && fr.pc+2 < len(fr.fn.Code) {
+					in1 := fr.fn.Code[fr.pc+1]
+					var r types.Value
+					rOK := false
+					if in1.Op == bytecode.OpLoadCV && in1.Flags == 0 && (!fr.fn.HasGlobalsCV || in1.Op1 != fr.fn.GlobalsCV) {
+						rv := vm.slots[fr.cvBase+int(in1.Op1)]
+						if rv.Type == types.TypeLong || rv.Type == types.TypeDouble {
+							r = rv
+							rOK = true
+						}
+					} else if in1.Op == bytecode.OpConst && in1.Flags == 0 {
+						rv := fr.fn.Consts[in1.Op1]
+						if rv.Type == types.TypeLong || rv.Type == types.TypeDouble {
+							r = rv
+							rOK = true
+						}
 					}
-				}
-				arr.Len = ht.N_elements
-			}
-			pc++
-
-		case OpArrayGet:
-			key := vm.Pop()
-			arr := vm.Pop()
-			if arr.Type == types.TypeArray && int(arr.Data) < len(vm.SwissTables) {
-				tIdx := int(arr.Data)
-				ht := &vm.SwissTables[tIdx]
-				k := key.ToLong()
-				idx := c2ordered_swiss.Swiss_find_int(ht, k)
-				if idx >= 0 && k >= 0 && k < 64 {
-					resVal := vm.SwissValues[tIdx][k]
-					vm.Push(resVal)
-				} else {
-					vm.Push(types.NewNull())
-				}
-			} else {
-				vm.Push(types.NewNull())
-			}
-			pc++
-
-		case OpArrayPop:
-			arr := vm.Pop()
-			if arr.Type == types.TypeArray && int(arr.Data) < len(vm.SwissTables) {
-				ht := &vm.SwissTables[arr.Data]
-				ok := c2ordered_swiss.Swiss_pop(ht)
-				vm.Push(types.NewBool(ok))
-			} else {
-				vm.Push(types.NewBool(false))
-			}
-			pc++
-
-		case OpArrayLen:
-			arr := vm.Pop()
-			if arr.Type == types.TypeArray && int(arr.Data) < len(vm.SwissTables) {
-				ht := &vm.SwissTables[arr.Data]
-				vm.Push(types.NewLong(int64(ht.N_elements)))
-			} else {
-				vm.Push(types.NewLong(0))
-			}
-			pc++
-
-		case OpArrayIterInit:
-			// Initialise un index d'itération sur la pile (index 0)
-			vm.Push(types.NewLong(0))
-			pc++
-
-		case OpArrayIterNext:
-			// Stack: [array, iterIndex] -> Si iterIndex < array.Len: push iterIndex+1, push key, push val, pc++
-			// Sinon: pop iterIndex, pop array, jump to target (ins.A)
-			iterVal := vm.Pop()
-			arr := vm.Peek() // laisse arr sur la pile pour l'itération suivante
-			idx := iterVal.ToLong()
-			if arr.Type == types.TypeArray && int(arr.Data) < len(vm.SwissTables) {
-				tIdx := int(arr.Data)
-				ht := &vm.SwissTables[tIdx]
-				if uint32(idx) < ht.N_elements && int(idx) < len(ht.Entries) && ht.Entries[idx].Val.Type_ != 0 {
-					elem := ht.Entries[idx]
-					k := elem.Int_key
-					// Remet le prochain index
-					vm.Push(types.NewLong(idx + 1))
-					// Push key
-					vm.Push(types.NewLong(k))
-					// Push value
-					var val types.Value
-					if k >= 0 && k < 64 {
-						val = vm.SwissValues[tIdx][k]
-					}
-					vm.Push(val)
-					pc++
-				} else {
-					// Fin de boucle : dépile le tableau et saute
-					_ = vm.Pop() // pop arr
-					pc = int(ins.A)
-				}
-			} else {
-				_ = vm.Pop() // pop arr
-				pc = int(ins.A)
-			}
-
-		// Contrôle de flux
-		case OpJmp:
-			pc = int(ins.A)
-
-		case OpJmpZ:
-			cond := vm.Pop()
-			if !cond.ToBool() {
-				pc = int(ins.A)
-			} else {
-				pc++
-			}
-
-		case OpJmpNZ:
-			cond := vm.Pop()
-			if cond.ToBool() {
-				pc = int(ins.A)
-			} else {
-				pc++
-			}
-
-		case OpSwitch:
-			// ins.A = nombre de cases, les instructions suivantes ou Const contiennent les mappings
-			// Pour un switch rapide, dispatch sur comparaison directe
-			val := vm.Pop()
-			matchFound := false
-			_ = val
-			_ = matchFound
-			pc++
-
-		// Fonctions & Frames
-		case OpCall:
-			funcIdx := int(ins.A)
-			numArgs := ins.B
-			if funcIdx < len(vm.Functions) {
-				calleeProg := &vm.Functions[funcIdx]
-				if vm.FP >= len(vm.Frames) {
-					newFrames := make([]CallFrame, len(vm.Frames)*2)
-					copy(newFrames, vm.Frames)
-					vm.Frames = newFrames
-				}
-				baseVar := (vm.FP + 1) * 32
-				if baseVar+32 >= len(vm.Vars) {
-					newVars := make([]types.Value, baseVar+64)
-					copy(newVars, vm.Vars)
-					vm.Vars = newVars
-				}
-				frame := CallFrame{
-					ReturnPC: pc + 1,
-					BaseSP:   vm.SP - int(numArgs),
-					BaseVar:  baseVar,
-					NumArgs:  numArgs,
-					Prog:     currentProg,
-				}
-				vm.Frames[vm.FP] = frame
-				vm.FP++
-				currentProg = calleeProg
-				pc = 0
-			} else {
-				return types.NewNull(), fmt.Errorf("fonction #%d introuvable", funcIdx)
-			}
-
-		case OpCallDynamic:
-			numArgs := ins.A
-			callee := vm.Pop()
-			funcIdx := -1
-
-			if callee.Type == types.TypeLong {
-				funcIdx = int(callee.ToLong())
-			} else if callee.Type == types.TypeObject && int(callee.Data) < len(vm.Objects) {
-				obj := &vm.Objects[callee.Data]
-				cls := vm.Classes[obj.ClassIdx]
-				if mIdx, ok := cls.Methods["__invoke"]; ok {
-					funcIdx = int(mIdx)
-				}
-			}
-
-			if funcIdx >= 0 && funcIdx < len(vm.Functions) {
-				calleeProg := &vm.Functions[funcIdx]
-				if vm.FP >= len(vm.Frames) {
-					newFrames := make([]CallFrame, len(vm.Frames)*2)
-					copy(newFrames, vm.Frames)
-					vm.Frames = newFrames
-				}
-				baseVar := (vm.FP + 1) * 32
-				if baseVar+32 >= len(vm.Vars) {
-					newVars := make([]types.Value, baseVar+64)
-					copy(newVars, vm.Vars)
-					vm.Vars = newVars
-				}
-				frame := CallFrame{
-					ReturnPC: pc + 1,
-					BaseSP:   vm.SP - int(numArgs),
-					BaseVar:  baseVar,
-					NumArgs:  numArgs,
-					Prog:     currentProg,
-				}
-				vm.Frames[vm.FP] = frame
-				vm.FP++
-				if callee.Type == types.TypeObject {
-					vm.Vars[frame.BaseVar] = callee
-				}
-				currentProg = calleeProg
-				pc = 0
-			} else {
-				vm.SP -= int(numArgs)
-				vm.Push(types.NewNull())
-				pc++
-			}
-
-		case OpGetArg:
-			argIdx := int(ins.A)
-			if vm.FP > 0 {
-				frame := vm.Frames[vm.FP-1]
-				if argIdx < int(frame.NumArgs) {
-					val := vm.Stack[frame.BaseSP+argIdx]
-					vm.Push(val)
-				} else {
-					vm.Push(types.NewNull())
-				}
-			} else {
-				vm.Push(types.NewNull())
-			}
-			pc++
-
-		case OpRetFrame:
-			var retVal types.Value = types.NewNull()
-			if vm.SP > 0 {
-				retVal = vm.Pop()
-			}
-			if vm.FP > 0 {
-				vm.FP--
-				frame := vm.Frames[vm.FP]
-				// Nettoie la pile d'arguments
-				vm.SP = frame.BaseSP
-				// Si constructeur, la valeur résultante de 'new' est l'instance $this
-				if frame.IsConstructor {
-					retVal = vm.Vars[frame.BaseVar]
-				}
-				// Remet la valeur de retour sur la pile appelante
-				vm.Push(retVal)
-				pc = frame.ReturnPC
-				if frame.Prog != nil {
-					currentProg = frame.Prog
-				} else {
-					currentProg = prog
-				}
-			} else {
-				return retVal, nil
-			}
-
-		case OpThrow:
-			excVal := vm.Pop()
-			handled := false
-
-			for {
-				base := 0
-				if vm.FP > 0 {
-					base = vm.Frames[vm.FP-1].BaseVar
-				}
-
-				for _, h := range currentProg.ExceptionHandlers {
-					if pc >= h.StartPC && pc < h.EndPC {
-						matched := false
-						if excVal.Type == types.TypeObject && int(excVal.Data) < len(vm.Objects) {
-							obj := &vm.Objects[excVal.Data]
-							currIdx := int(obj.ClassIdx)
-							depth := 0
-							for currIdx < len(vm.Classes) && depth < 32 {
-								depth++
-								cls := vm.Classes[currIdx]
-								if h.CatchType == "" || strings.EqualFold(h.CatchType, "Throwable") || strings.EqualFold(cls.Name, h.CatchType) || strings.EqualFold(cls.Parent, h.CatchType) {
-									matched = true
-									break
-								}
-								if strings.EqualFold(h.CatchType, "Exception") && (strings.EqualFold(cls.Name, "Exception") || strings.EqualFold(cls.Parent, "Exception") || strings.Contains(strings.ToLower(cls.Name), "exception")) {
-									matched = true
-									break
-								}
-								if strings.EqualFold(h.CatchType, "Error") && (strings.EqualFold(cls.Name, "Error") || strings.EqualFold(cls.Parent, "Error") || strings.Contains(strings.ToLower(cls.Name), "error")) {
-									matched = true
-									break
-								}
-								for _, iface := range cls.Implements {
-									if strings.EqualFold(iface, h.CatchType) {
-										matched = true
-										break
+					if rOK {
+						in2 := fr.fn.Code[fr.pc+2]
+						switch in2.Op {
+						case bytecode.OpIsSmaller, bytecode.OpIsSmallerOrEqual, bytecode.OpIsEqual, bytecode.OpIsIdentical, bytecode.OpIsNotEqual, bytecode.OpIsNotIdentical:
+							if fr.pc+3 < len(fr.fn.Code) {
+								in3 := fr.fn.Code[fr.pc+3]
+								if in3.Op == bytecode.OpJmpZ || in3.Op == bytecode.OpJmpNZ {
+									var res bool
+									if slot.Type == types.TypeLong && r.Type == types.TypeLong {
+										switch in2.Op {
+										case bytecode.OpIsSmaller:
+											res = int64(slot.Scalar) < int64(r.Scalar)
+										case bytecode.OpIsSmallerOrEqual:
+											res = int64(slot.Scalar) <= int64(r.Scalar)
+										case bytecode.OpIsEqual, bytecode.OpIsIdentical:
+											res = slot.Scalar == r.Scalar
+										default:
+											res = slot.Scalar != r.Scalar
+										}
+									} else {
+										lf, rf := slot.ToDouble(), r.ToDouble()
+										switch in2.Op {
+										case bytecode.OpIsSmaller:
+											res = lf < rf
+										case bytecode.OpIsSmallerOrEqual:
+											res = lf <= rf
+										case bytecode.OpIsEqual:
+											res = lf == rf
+										case bytecode.OpIsIdentical:
+											res = slot.Type == r.Type && lf == rf
+										case bytecode.OpIsNotIdentical:
+											res = slot.Type != r.Type || lf != rf
+										default:
+											res = lf != rf
+										}
 									}
-								}
-								if matched || cls.Parent == "" {
-									break
-								}
-								if pIdx, ok := vm.ClassMap[strings.ToLower(cls.Parent)]; ok {
-									currIdx = int(pIdx)
-								} else {
-									break
+									if in3.Op == bytecode.OpJmpZ {
+										if !res {
+											fr.pc = int(in3.Op1)
+										} else {
+											fr.pc += 4
+										}
+									} else {
+										if res {
+											fr.pc = int(in3.Op1)
+										} else {
+											fr.pc += 4
+										}
+									}
+									continue
 								}
 							}
-						} else if h.CatchType == "" || strings.EqualFold(h.CatchType, "Throwable") {
-							matched = true
-						}
-
-						if matched {
-							if vm.FP > 0 {
-								vm.SP = vm.Frames[vm.FP-1].BaseSP
-							} else {
-								vm.SP = 0
+						case bytecode.OpAdd:
+							res := types.Add(slot, r)
+							if fr.pc+3 < len(fr.fn.Code) && fr.fn.Code[fr.pc+3].Op == bytecode.OpStoreCV && fr.fn.Code[fr.pc+3].Flags == 0 {
+								dst := &vm.slots[fr.cvBase+int(fr.fn.Code[fr.pc+3].Op1)]
+								if dst.Type <= types.TypeDouble {
+									*dst = res
+									fr.pc += 4
+									continue
+								}
 							}
-							slot := base + int(h.CatchVar)
-							if slot < len(vm.Vars) {
-								vm.Vars[slot] = excVal
+							if fr.evalTop < fr.evalBase+fr.fn.MaxStack {
+								vm.slots[fr.evalTop] = res
+								fr.evalTop++
+								fr.pc += 3
+								continue
 							}
-							pc = h.CatchPC
-							handled = true
-							break
+						case bytecode.OpSub:
+							res := types.Sub(slot, r)
+							if fr.pc+3 < len(fr.fn.Code) && fr.fn.Code[fr.pc+3].Op == bytecode.OpStoreCV && fr.fn.Code[fr.pc+3].Flags == 0 {
+								dst := &vm.slots[fr.cvBase+int(fr.fn.Code[fr.pc+3].Op1)]
+								if dst.Type <= types.TypeDouble {
+									*dst = res
+									fr.pc += 4
+									continue
+								}
+							}
+							if fr.evalTop < fr.evalBase+fr.fn.MaxStack {
+								vm.slots[fr.evalTop] = res
+								fr.evalTop++
+								fr.pc += 3
+								continue
+							}
+						case bytecode.OpMul:
+							res := types.Mul(slot, r)
+							if fr.pc+3 < len(fr.fn.Code) && fr.fn.Code[fr.pc+3].Op == bytecode.OpStoreCV && fr.fn.Code[fr.pc+3].Flags == 0 {
+								dst := &vm.slots[fr.cvBase+int(fr.fn.Code[fr.pc+3].Op1)]
+								if dst.Type <= types.TypeDouble {
+									*dst = res
+									fr.pc += 4
+									continue
+								}
+							}
+							if fr.evalTop < fr.evalBase+fr.fn.MaxStack {
+								vm.slots[fr.evalTop] = res
+								fr.evalTop++
+								fr.pc += 3
+								continue
+							}
 						}
 					}
 				}
-
-				if handled {
-					break
-				}
-
-				// Unwind frame
-				if vm.FP > 0 {
-					vm.FP--
-					frame := vm.Frames[vm.FP]
-					vm.SP = frame.BaseSP
-					pc = frame.ReturnPC
-					if frame.Prog != nil {
-						currentProg = frame.Prog
+				if slot.Type <= types.TypeDouble && fr.evalTop < fr.evalBase+fr.fn.MaxStack {
+					if slot.Type == types.TypeUndef {
+						vm.slots[fr.evalTop] = types.NewNull()
 					} else {
-						currentProg = prog
+						vm.slots[fr.evalTop] = slot
 					}
-				} else {
-					msg := excVal.String()
-					if excVal.Type == types.TypeObject && int(excVal.Data) < len(vm.Objects) {
-						obj := &vm.Objects[excVal.Data]
-						if obj.Props[0].Type == types.TypeString {
-							msg = obj.Props[0].String()
-						}
-						return types.NewNull(), fmt.Errorf("Uncaught %s: %s", obj.ClassName, msg)
-					}
-					return types.NewNull(), fmt.Errorf("Uncaught Exception: %s", msg)
-				}
-			}
-			if handled {
-				continue
-			}
-
-		// Modèle Objet & Classes
-		case OpNewObject:
-			classIdx := int(ins.A)
-			numArgs := ins.B
-			if classIdx < len(vm.Classes) {
-				if vm.NextObject >= len(vm.Objects) {
-					newObjects := make([]ObjectInstance, len(vm.Objects)*2)
-					copy(newObjects, vm.Objects)
-					vm.Objects = newObjects
-				}
-				cls := &vm.Classes[classIdx]
-				objIdx := vm.NextObject
-				vm.NextObject++
-				obj := &vm.Objects[objIdx]
-				obj.ClassIdx = uint16(classIdx)
-				obj.ClassName = cls.Name
-				if len(cls.PropDefaults) > len(obj.PropsBuf) {
-					obj.Props = make([]types.Value, len(cls.PropDefaults))
-				} else {
-					obj.Props = obj.PropsBuf[:len(cls.PropDefaults)]
-				}
-				for pIdx, defVal := range cls.PropDefaults {
-					obj.Props[pIdx] = defVal
-				}
-				objVal := types.Value{Type: types.TypeObject, Data: int64(objIdx)}
-
-				// Instanciation spéciale PDO
-				if cls.Name == "PDO" {
-					dsnStr := ""
-					userStr := ""
-					passStr := ""
-					if numArgs >= 1 {
-						dsnStr = vm.Stack[vm.SP-int(numArgs)].String()
-					}
-					if numArgs >= 2 {
-						userStr = vm.Stack[vm.SP-int(numArgs)+1].String()
-					}
-					if numArgs >= 3 {
-						passStr = vm.Stack[vm.SP-int(numArgs)+2].String()
-					}
-					p, _ := pdo.NewPDO(dsnStr, userStr, passStr, nil)
-					if p != nil {
-						pId := pdo.RegisterPDOInstance(p)
-						obj.Props[0] = types.NewLong(pId)
-					}
-					vm.SP -= int(numArgs)
-					vm.Push(objVal)
-					pc++
+					fr.evalTop++
+					fr.pc++
 					continue
 				}
-
-				// Si constructeur présent
-				if ctorIdx, ok := cls.Methods["__construct"]; ok && int(ctorIdx) < len(vm.Functions) {
-					calleeProg := &vm.Functions[ctorIdx]
-					if vm.FP >= len(vm.Frames) {
-						newFrames := make([]CallFrame, len(vm.Frames)*2)
-						copy(newFrames, vm.Frames)
-						vm.Frames = newFrames
-					}
-					baseVar := (vm.FP + 1) * 32
-					if baseVar+32 >= len(vm.Vars) {
-						newVars := make([]types.Value, baseVar+64)
-						copy(newVars, vm.Vars)
-						vm.Vars = newVars
-					}
-					frame := CallFrame{
-						ReturnPC:      pc + 1,
-						BaseSP:        vm.SP - int(numArgs),
-						BaseVar:       baseVar,
-						NumArgs:       numArgs,
-						IsConstructor: true,
-						Prog:          currentProg,
-					}
-					vm.Frames[vm.FP] = frame
-					vm.FP++
-					// $this dans slot 0 de la frame
-					vm.Vars[frame.BaseVar] = objVal
-					currentProg = calleeProg
-					pc = 0
-				} else {
-					// Pas de constructeur : dépiler les arguments s'il y en avait
-					vm.SP -= int(numArgs)
-					vm.Push(objVal)
-					pc++
-				}
-			} else {
-				vm.Push(types.NewNull())
-				pc++
 			}
-
-		case OpGetProp:
-			propSlot := int(ins.A)
-			target := vm.Pop()
-			if target.Type == types.TypeObject && int(target.Data) < len(vm.Objects) {
-				obj := &vm.Objects[target.Data]
-				if propSlot < len(obj.Props) {
-					vm.Push(obj.Props[propSlot])
-				} else {
-					vm.Push(types.NewNull())
+			vm.opLoadCV(in)
+		case bytecode.OpStoreCV:
+			if in.Flags == 0 && !fr.fn.HasDynamicCV && fr.evalTop > fr.evalBase {
+				v := vm.slots[fr.evalTop-1]
+				slot := &vm.slots[fr.cvBase+int(in.Op1)]
+				if v.Type <= types.TypeDouble && slot.Type <= types.TypeDouble {
+					fr.evalTop--
+					vm.slots[fr.evalTop] = types.Value{}
+					*slot = v
+					fr.pc++
+					continue
 				}
-			} else {
-				vm.Push(types.NewNull())
 			}
-			pc++
-
-		case OpSetProp:
-			propSlot := int(ins.A)
-			val := vm.Pop()
-			target := vm.Pop()
-			if target.Type == types.TypeObject && int(target.Data) < len(vm.Objects) {
-				obj := &vm.Objects[target.Data]
-				if propSlot >= len(obj.Props) {
-					newProps := make([]types.Value, propSlot+1)
-					copy(newProps, obj.Props)
-					obj.Props = newProps
+			vm.opStore(in.Op1, false, in.Flags)
+		case bytecode.OpAssignCV:
+			if in.Flags == 0 && !fr.fn.HasDynamicCV && fr.evalTop > fr.evalBase {
+				v := vm.slots[fr.evalTop-1]
+				slot := &vm.slots[fr.cvBase+int(in.Op1)]
+				if v.Type <= types.TypeDouble && slot.Type <= types.TypeDouble {
+					*slot = v
+					fr.pc++
+					continue
 				}
-				obj.Props[propSlot] = val
 			}
-			pc++
-
-		case OpCallMethod:
-			funcIdx := int(ins.A)
-			numArgs := ins.B
-			isNullsafe := ins.C == 1
-
-			// Target object is at vm.Stack[vm.SP - int(numArgs) - 1]
-			targetIdx := vm.SP - int(numArgs) - 1
-			if targetIdx >= 0 {
-				target := vm.Stack[targetIdx]
-				if target.Type == types.TypeObject && int(target.Data) < len(vm.Objects) {
-					obj := &vm.Objects[target.Data]
-					if vm.isNativeClass(obj.ClassName) {
-						resVal := vm.dispatchNativeMethod(obj, funcIdx, targetIdx, int(numArgs))
-						vm.SP = targetIdx
-						vm.Push(resVal)
-						pc++
+			vm.opStore(in.Op1, true, in.Flags)
+		case bytecode.OpConst:
+			if in.Flags == 0 {
+				c := fr.fn.Consts[in.Op1]
+				if c.Type <= types.TypeDouble && fr.evalTop < fr.evalBase+fr.fn.MaxStack {
+					vm.slots[fr.evalTop] = c
+					fr.evalTop++
+					fr.pc++
+					continue
+				}
+			}
+			vm.opConst(in)
+		case bytecode.OpPop:
+			if fr.evalTop > fr.evalBase {
+				top := fr.evalTop - 1
+				v := vm.slots[top]
+				if v.Type <= types.TypeDouble {
+					fr.evalTop = top
+					vm.slots[top] = types.Value{}
+					fr.pc++
+					continue
+				}
+			}
+			v := vm.pop()
+			vmRelease(vm.Zone, &v)
+			vm.bump()
+		case bytecode.OpAdd:
+			if fr.evalTop-fr.evalBase >= 2 {
+				r := vm.slots[fr.evalTop-1]
+				l := vm.slots[fr.evalTop-2]
+				if (l.Type == types.TypeLong || l.Type == types.TypeDouble) && (r.Type == types.TypeLong || r.Type == types.TypeDouble) {
+					fr.evalTop--
+					vm.slots[fr.evalTop] = types.Value{}
+					vm.slots[fr.evalTop-1] = types.Add(l, r)
+					fr.pc++
+					continue
+				}
+			}
+			vm.opBinary(op)
+		case bytecode.OpSub:
+			if fr.evalTop-fr.evalBase >= 2 {
+				r := vm.slots[fr.evalTop-1]
+				l := vm.slots[fr.evalTop-2]
+				if (l.Type == types.TypeLong || l.Type == types.TypeDouble) && (r.Type == types.TypeLong || r.Type == types.TypeDouble) {
+					fr.evalTop--
+					vm.slots[fr.evalTop] = types.Value{}
+					vm.slots[fr.evalTop-1] = types.Sub(l, r)
+					fr.pc++
+					continue
+				}
+			}
+			vm.opBinary(op)
+		case bytecode.OpMul:
+			if fr.evalTop-fr.evalBase >= 2 {
+				r := vm.slots[fr.evalTop-1]
+				l := vm.slots[fr.evalTop-2]
+				if (l.Type == types.TypeLong || l.Type == types.TypeDouble) && (r.Type == types.TypeLong || r.Type == types.TypeDouble) {
+					fr.evalTop--
+					vm.slots[fr.evalTop] = types.Value{}
+					vm.slots[fr.evalTop-1] = types.Mul(l, r)
+					fr.pc++
+					continue
+				}
+			}
+			vm.opBinary(op)
+		case bytecode.OpBWAnd, bytecode.OpBWOr, bytecode.OpBWXor, bytecode.OpSL, bytecode.OpSR:
+			if fr.evalTop-fr.evalBase >= 2 {
+				r := vm.slots[fr.evalTop-1]
+				l := vm.slots[fr.evalTop-2]
+				if l.Type == types.TypeLong && r.Type == types.TypeLong {
+					switch op {
+					case bytecode.OpBWAnd:
+						fr.evalTop--
+						vm.slots[fr.evalTop] = types.Value{}
+						vm.slots[fr.evalTop-1] = types.NewLong(int64(l.Scalar & r.Scalar))
+						fr.pc++
 						continue
-					}
-					if funcIdx < len(vm.Functions) {
-						calleeProg := &vm.Functions[funcIdx]
-						frame := CallFrame{
-							ReturnPC: pc + 1,
-							BaseSP:   targetIdx,
-							BaseVar:  (vm.FP + 1) * 32,
-							NumArgs:  numArgs + 1,
-							Prog:     currentProg,
-						}
-						vm.Frames[vm.FP] = frame
-						vm.FP++
-						// $this dans slot 0
-						vm.Vars[frame.BaseVar] = target
-						currentProg = calleeProg
-						pc = 0
+					case bytecode.OpBWOr:
+						fr.evalTop--
+						vm.slots[fr.evalTop] = types.Value{}
+						vm.slots[fr.evalTop-1] = types.NewLong(int64(l.Scalar | r.Scalar))
+						fr.pc++
 						continue
-					}
-				}
-				if isNullsafe {
-					vm.SP = targetIdx
-					vm.Push(types.NewNull())
-					pc++
-				} else {
-					vm.SP = targetIdx
-					vm.Push(types.NewNull())
-					pc++
-				}
-			} else {
-				vm.Push(types.NewNull())
-				pc++
-			}
-
-		case OpCallStatic:
-			funcIdx := int(ins.A)
-			numArgs := ins.B
-			if funcIdx < len(vm.Functions) {
-				calleeProg := &vm.Functions[funcIdx]
-				frame := CallFrame{
-					ReturnPC: pc + 1,
-					BaseSP:   vm.SP - int(numArgs),
-					BaseVar:  (vm.FP + 1) * 32,
-					NumArgs:  numArgs,
-					Prog:     currentProg,
-				}
-				vm.Frames[vm.FP] = frame
-				vm.FP++
-				currentProg = calleeProg
-				pc = 0
-			} else {
-				vm.Push(types.NewNull())
-				pc++
-			}
-
-		case OpGetConst:
-			clsIdx := int(ins.A)
-			constStrIdx := int(ins.B)
-			res := types.NewNull()
-			if clsIdx < len(vm.Classes) && constStrIdx < len(currentProg.StringPool) {
-				cls := &vm.Classes[clsIdx]
-				cName := currentProg.StringPool[constStrIdx]
-				if cls.Constants != nil {
-					if val, ok := cls.Constants[cName]; ok {
-						res = val
-					}
-				}
-			}
-			vm.Push(res)
-			pc++
-
-		case OpInstanceOf:
-			strIdx := int(ins.A)
-			target := vm.Pop()
-			matched := false
-			if target.Type == types.TypeObject && int(target.Data) < len(vm.Objects) && strIdx < len(currentProg.StringPool) {
-				obj := &vm.Objects[target.Data]
-				targetClsName := currentProg.StringPool[strIdx]
-				currIdx := int(obj.ClassIdx)
-				for currIdx < len(vm.Classes) {
-					cls := vm.Classes[currIdx]
-					if strings.EqualFold(cls.Name, targetClsName) || strings.EqualFold(cls.Parent, targetClsName) {
-						matched = true
-						break
-					}
-					for _, iface := range cls.Implements {
-						if strings.EqualFold(iface, targetClsName) {
-							matched = true
-							break
+					case bytecode.OpBWXor:
+						fr.evalTop--
+						vm.slots[fr.evalTop] = types.Value{}
+						vm.slots[fr.evalTop-1] = types.NewLong(int64(l.Scalar ^ r.Scalar))
+						fr.pc++
+						continue
+					case bytecode.OpSL:
+						if int64(r.Scalar) >= 0 && int64(r.Scalar) < 64 {
+							fr.evalTop--
+							vm.slots[fr.evalTop] = types.Value{}
+							vm.slots[fr.evalTop-1] = types.NewLong(int64(l.Scalar << (r.Scalar & 63)))
+							fr.pc++
+							continue
 						}
-					}
-					if matched || cls.Parent == "" {
-						break
-					}
-					if pIdx, ok := vm.ClassMap[strings.ToLower(cls.Parent)]; ok {
-						currIdx = int(pIdx)
-					} else {
-						break
-					}
-				}
-			}
-			vm.Push(types.NewBool(matched))
-			pc++
-
-		// Buffers de sortie SPL
-		case OpObStart:
-			vm.OutputBuffers = append(vm.OutputBuffers, make([]byte, 0, 256))
-			pc++
-
-		case OpObGetClean:
-			if len(vm.OutputBuffers) > 0 {
-				top := vm.OutputBuffers[len(vm.OutputBuffers)-1]
-				vm.OutputBuffers = vm.OutputBuffers[:len(vm.OutputBuffers)-1]
-				vm.Push(types.NewString(string(top)))
-			} else {
-				vm.Push(types.NewBool(false))
-			}
-			pc++
-
-		case OpObGetContents:
-			if len(vm.OutputBuffers) > 0 {
-				top := vm.OutputBuffers[len(vm.OutputBuffers)-1]
-				vm.Push(types.NewString(string(top)))
-			} else {
-				vm.Push(types.NewBool(false))
-			}
-			pc++
-
-		case OpObEndFlush:
-			if len(vm.OutputBuffers) > 0 {
-				top := vm.OutputBuffers[len(vm.OutputBuffers)-1]
-				vm.OutputBuffers = vm.OutputBuffers[:len(vm.OutputBuffers)-1]
-				if len(vm.OutputBuffers) > 0 {
-					vm.OutputBuffers[len(vm.OutputBuffers)-1] = append(vm.OutputBuffers[len(vm.OutputBuffers)-1], top...)
-				} else if vm.Output != nil {
-					vm.Output.Write(top)
-				}
-			}
-			pc++
-
-		case OpBuiltinCall:
-			builtinId := ins.A
-			numArgs := int(ins.B)
-			var builtinBuf [16]types.Value
-			n := numArgs
-			if n > 16 {
-				n = 16
-			}
-			for i := numArgs - 1; i >= 0; i-- {
-				val := vm.Pop()
-				if i < 16 {
-					builtinBuf[i] = val
-				}
-			}
-			args := builtinBuf[:n]
-			var res types.Value = types.NewNull()
-
-			switch builtinId {
-			case 1: // json_encode
-				if len(args) >= 1 {
-					res = builtins.JsonEncode(args[0])
-				}
-			case 2: // json_decode
-				if len(args) >= 1 {
-					assoc := false
-					if len(args) >= 2 {
-						assoc = args[1].ToBool()
-					}
-					res = builtins.JsonDecode(args[0], assoc)
-				}
-			case 3: // md5
-				if len(args) >= 1 {
-					res = builtins.Md5(args[0])
-				}
-			case 4: // sha256
-				if len(args) >= 1 {
-					res = builtins.Sha256(args[0])
-				}
-			case 5: // hash
-				if len(args) >= 2 {
-					res = builtins.Hash(args[0], args[1])
-				}
-			case 6: // hash_hmac
-				if len(args) >= 3 {
-					res = builtins.HashHmac(args[0], args[1], args[2])
-				}
-			case 7: // random_bytes
-				if len(args) >= 1 {
-					res = builtins.RandomBytes(args[0])
-				}
-			case 8: // bin2hex
-				if len(args) >= 1 {
-					res = builtins.Bin2Hex(args[0])
-				}
-			case 9: // hex2bin
-				if len(args) >= 1 {
-					res = builtins.Hex2Bin(args[0])
-				}
-			case 10: // time
-				res = builtins.Time()
-			case 11: // microtime
-				asFloat := false
-				if len(args) >= 1 {
-					asFloat = args[0].ToBool()
-				}
-				res = builtins.Microtime(asFloat)
-			case 12: // date
-				if len(args) >= 1 {
-					ts := types.NewNull()
-					if len(args) >= 2 {
-						ts = args[1]
-					}
-					res = builtins.Date(args[0], ts)
-				}
-			case 13: // strtotime
-				if len(args) >= 1 {
-					res = builtins.Strtotime(args[0])
-				}
-			case 14: // trim
-				if len(args) >= 1 {
-					mask := types.NewNull()
-					if len(args) >= 2 {
-						mask = args[1]
-					}
-					res = builtins.Trim(args[0], mask)
-				}
-			case 15: // ltrim
-				if len(args) >= 1 {
-					mask := types.NewNull()
-					if len(args) >= 2 {
-						mask = args[1]
-					}
-					res = builtins.Ltrim(args[0], mask)
-				}
-			case 16: // rtrim
-				if len(args) >= 1 {
-					mask := types.NewNull()
-					if len(args) >= 2 {
-						mask = args[1]
-					}
-					res = builtins.Rtrim(args[0], mask)
-				}
-			case 17: // strtolower
-				if len(args) >= 1 {
-					res = builtins.Strtolower(args[0])
-				}
-			case 18: // strtoupper
-				if len(args) >= 1 {
-					res = builtins.Strtoupper(args[0])
-				}
-			case 19: // str_replace
-				if len(args) >= 3 {
-					res = builtins.StrReplace(args[0], args[1], args[2])
-				}
-			case 20: // str_repeat
-				if len(args) >= 2 {
-					res = builtins.StrRepeat(args[0], args[1])
-				}
-			case 21: // is_callable
-				if len(args) >= 1 {
-					res = builtins.IsCallable(args[0])
-				}
-			case 30: // file_get_contents
-				if len(args) >= 1 && vm.Streams != nil {
-					res = vm.Streams.FileGetContents(args[0])
-				}
-			case 31: // file_put_contents
-				if len(args) >= 2 && vm.Streams != nil {
-					res = vm.Streams.FilePutContents(args[0], args[1])
-				}
-			case 32: // file_exists
-				if len(args) >= 1 && vm.Streams != nil {
-					res = vm.Streams.FileExists(args[0])
-				}
-			case 33: // dirname
-				if len(args) >= 1 {
-					res = streams.Dirname(args[0])
-				}
-			case 34: // basename
-				if len(args) >= 1 {
-					res = streams.Basename(args[0])
-				}
-			case 35: // pdo_exec
-				if len(args) >= 1 && vm.DB != nil {
-					n, _ := vm.DB.Exec(args[0].String(), args[1:]...)
-					res = types.NewLong(n)
-				}
-			case 36: // pdo_query
-				if len(args) >= 1 && vm.DB != nil {
-					rows, _ := vm.DB.Query(args[0].String(), args[1:]...)
-					res = types.NewLong(int64(len(rows)))
-				}
-			case 37: // pdo_last_id
-				if vm.DB != nil {
-					res = types.NewLong(vm.DB.LastInsertId())
-				}
-			case 40: // fiber_create
-				if len(args) >= 1 {
-					fId := vm.NextFiber
-					vm.NextFiber++
-					vm.Fibers[fId] = &FiberInstance{
-						State:    FiberInit,
-						Callable: args[0],
-					}
-					res = types.Value{Type: types.TypeObject, Data: fId}
-				}
-			case 41: // fiber_start
-				if len(args) >= 1 && args[0].Type == types.TypeObject {
-					fId := args[0].Data
-					if fib, ok := vm.Fibers[fId]; ok && fib.State == FiberInit {
-						fib.State = FiberRunning
-						funcIdx := -1
-						if fib.Callable.Type == types.TypeLong {
-							funcIdx = int(fib.Callable.ToLong())
-						} else if fib.Callable.Type == types.TypeObject && int(fib.Callable.Data) < len(vm.Objects) {
-							obj := &vm.Objects[fib.Callable.Data]
-							cls := vm.Classes[obj.ClassIdx]
-							if mIdx, ok := cls.Methods["__invoke"]; ok {
-								funcIdx = int(mIdx)
-							}
-						}
-						if funcIdx >= 0 && funcIdx < len(vm.Functions) {
-							calleeProg := &vm.Functions[funcIdx]
-							fiberVM := NewVM(vm.Output)
-							fiberVM.Functions = vm.Functions
-							fiberVM.Classes = vm.Classes
-							fiberVM.ClassMap = vm.ClassMap
-							fiberVM.DB = vm.DB
-							fiberVM.Streams = vm.Streams
-							ret, _ := fiberVM.Execute(calleeProg)
-							fib.State = FiberTerminated
-							fib.ReturnVal = ret
-							res = ret
+					case bytecode.OpSR:
+						if int64(r.Scalar) >= 0 && int64(r.Scalar) < 64 {
+							fr.evalTop--
+							vm.slots[fr.evalTop] = types.Value{}
+							vm.slots[fr.evalTop-1] = types.NewLong(int64(l.Scalar) >> (r.Scalar & 63))
+							fr.pc++
+							continue
 						}
 					}
 				}
-			case 42: // fiber_suspend
-				if len(args) >= 1 {
-					res = args[0]
+			}
+			vm.opBinary(op)
+		case bytecode.OpIsSmaller, bytecode.OpIsSmallerOrEqual, bytecode.OpIsEqual, bytecode.OpIsIdentical, bytecode.OpIsNotEqual, bytecode.OpIsNotIdentical:
+			if fr.evalTop-fr.evalBase >= 2 {
+				r := vm.slots[fr.evalTop-1]
+				l := vm.slots[fr.evalTop-2]
+				if l.Type == types.TypeLong && r.Type == types.TypeLong {
+					var res bool
+					switch op {
+					case bytecode.OpIsSmaller:
+						res = int64(l.Scalar) < int64(r.Scalar)
+					case bytecode.OpIsSmallerOrEqual:
+						res = int64(l.Scalar) <= int64(r.Scalar)
+					case bytecode.OpIsEqual, bytecode.OpIsIdentical:
+						res = l.Scalar == r.Scalar
+					default:
+						res = l.Scalar != r.Scalar
+					}
+					fr.evalTop--
+					vm.slots[fr.evalTop] = types.Value{}
+					vm.slots[fr.evalTop-1] = types.NewBool(res)
+					fr.pc++
+					continue
 				}
-			case 43: // fiber_resume
-				if len(args) >= 1 && args[0].Type == types.TypeObject {
-					fId := args[0].Data
-					if fib, ok := vm.Fibers[fId]; ok {
-						if len(args) >= 2 {
-							res = args[1]
+				if (l.Type == types.TypeLong || l.Type == types.TypeDouble) && (r.Type == types.TypeLong || r.Type == types.TypeDouble) {
+					lf, rf := l.ToDouble(), r.ToDouble()
+					var res bool
+					switch op {
+					case bytecode.OpIsSmaller:
+						res = lf < rf
+					case bytecode.OpIsSmallerOrEqual:
+						res = lf <= rf
+					case bytecode.OpIsEqual:
+						res = lf == rf
+					case bytecode.OpIsIdentical:
+						res = l.Type == r.Type && lf == rf
+					case bytecode.OpIsNotIdentical:
+						res = l.Type != r.Type || lf != rf
+					default:
+						res = lf != rf
+					}
+					fr.evalTop--
+					vm.slots[fr.evalTop] = types.Value{}
+					vm.slots[fr.evalTop-1] = types.NewBool(res)
+					fr.pc++
+					continue
+				}
+			}
+			vm.opCmp(op)
+		case bytecode.OpJmp:
+			if len(fr.fn.TryTable) == 0 {
+				fr.pc = int(in.Op1)
+				continue
+			}
+			vm.jump(int(in.Op1))
+		case bytecode.OpJmpZ, bytecode.OpJmpNZ:
+			if len(fr.fn.TryTable) == 0 && fr.evalTop > fr.evalBase {
+				top := fr.evalTop - 1
+				v := vm.slots[top]
+				if v.Type <= types.TypeLong {
+					fr.evalTop = top
+					vm.slots[top] = types.Value{}
+					truth := v.Type == types.TypeTrue || (v.Type == types.TypeLong && v.Scalar != 0)
+					if op == bytecode.OpJmpZ {
+						if !truth {
+							fr.pc = int(in.Op1)
 						} else {
-							res = fib.ReturnVal
+							fr.pc++
+						}
+					} else {
+						if truth {
+							fr.pc = int(in.Op1)
+						} else {
+							fr.pc++
 						}
 					}
+					continue
 				}
-			case 44: // fiber_is_suspended
-				if len(args) >= 1 && args[0].Type == types.TypeObject {
-					if fib, ok := vm.Fibers[args[0].Data]; ok {
-						res = types.NewBool(fib.State == FiberSuspended)
-					} else {
-						res = types.NewBool(false)
+			}
+			vm.opCond(op, int(in.Op1))
+		case bytecode.OpYield, bytecode.OpYieldFrom:
+			vm.opYield(in)
+			if fr.gen != nil && fr.gen.yielded {
+				return
+			}
+		case bytecode.OpGlobalGet, bytecode.OpGlobalSet, bytecode.OpGlobalUnset, bytecode.OpGlobalIsset:
+			vm.opGlobal(in.Op)
+		case bytecode.OpBindGlobal:
+			vm.bindGlobal(in.Op1)
+		case bytecode.OpEval, bytecode.OpInclude:
+			vm.opSource(in)
+		case bytecode.OpStaticCheck:
+			if ref, ok := vm.localStatics[fr.fn][in.Op1]; ok {
+				slot := vm.cvPtr(in.Op1)
+				old := *slot
+				*slot = types.RetainReference(vm.Zone, ref)
+				vmRelease(vm.Zone, &old)
+				vm.jump(int(in.Op2))
+			} else {
+				vm.bump()
+			}
+		case bytecode.OpBindStatic:
+			v := vm.pop()
+			ref, err := types.NewReference(vm.Zone, v)
+			vmRelease(vm.Zone, &v)
+			if err != nil {
+				vm.fatalFeature("reference statique")
+				return
+			}
+			if vm.localStatics == nil {
+				vm.localStatics = make(map[*bytecode.OpArray]map[uint32]types.Value)
+			}
+			values := vm.localStatics[fr.fn]
+			if values == nil {
+				values = make(map[uint32]types.Value)
+				vm.localStatics[fr.fn] = values
+			}
+			oldStatic, hadOld := values[in.Op1]
+			values[in.Op1] = ref
+			if hadOld {
+				vmRelease(vm.Zone, &oldStatic)
+			}
+			slot := vm.cvPtr(in.Op1)
+			oldSlot := *slot
+			*slot = types.RetainReference(vm.Zone, ref)
+			vmRelease(vm.Zone, &oldSlot)
+			vm.bump()
+		case bytecode.OpNop, bytecode.OpEnterFinally:
+			vm.bump()
+		case bytecode.OpDup:
+			v := vm.pop()
+			vm.push(vmRetain(vm.Zone, v))
+			vm.push(v)
+			vm.bump()
+		case bytecode.OpEcho:
+			v := vm.pop()
+			vm.echo(v)
+			vmRelease(vm.Zone, &v)
+			vm.bump()
+		case bytecode.OpPrint:
+			v := vm.pop()
+			vm.echo(v)
+			vmRelease(vm.Zone, &v)
+			vm.push(types.NewLong(1))
+			vm.bump()
+		case bytecode.OpAssignRefCV:
+			vm.opAssignRef(in.Op1, in.Op2)
+		case bytecode.OpUnsetCV:
+			slot := vm.cvPtr(in.Op1)
+			old := *slot
+			*slot = types.Value{}
+			vmRelease(vm.Zone, &old)
+			vm.bump()
+		case bytecode.OpIssetCV:
+			vm.push(types.NewBool(vm.issetCV(in.Op1)))
+			vm.bump()
+		case bytecode.OpEmptyCV:
+			if fr.fn.HasGlobalsCV && in.Op1 == fr.fn.GlobalsCV || (!fr.fn.CVMetaResolved && int(in.Op1) < len(fr.fn.CVNames) && fr.fn.CVNames[in.Op1] == "GLOBALS") {
+				snap := vm.globalSnapshot()
+				empty := !types.ToBoolZ(vm.Zone, snap)
+				vmRelease(vm.Zone, &snap)
+				vm.push(types.NewBool(empty))
+				vm.bump()
+				continue
+			}
+			slot := vm.slots[fr.cvBase+int(in.Op1)]
+			vm.push(types.NewBool(!types.ToBoolZ(vm.Zone, slot)))
+			vm.bump()
+		case bytecode.OpMakeRef:
+			vm.opMakeRef()
+		case bytecode.OpDeref:
+			v := vm.pop()
+			d := vmRetain(vm.Zone, types.Deref(vm.Zone, v))
+			vmRelease(vm.Zone, &v)
+			vm.push(d)
+			vm.bump()
+		case bytecode.OpDiv, bytecode.OpMod, bytecode.OpPow, bytecode.OpConcat, bytecode.OpBoolXor:
+			vm.opBinary(op)
+		case bytecode.OpBWNot, bytecode.OpBoolNot, bytecode.OpUnaryPlus, bytecode.OpUnaryMinus, bytecode.OpCast:
+			vm.opUnary(op, in.Op1)
+		case bytecode.OpSpaceship:
+			vm.opCmp(op)
+		case bytecode.OpPreIncCV, bytecode.OpPreDecCV, bytecode.OpPostIncCV, bytecode.OpPostDecCV:
+			slotPtr := &vm.slots[fr.cvBase+int(in.Op1)]
+			if slotPtr.Type == types.TypeLong {
+				val := int64(slotPtr.Scalar)
+				if val != 9223372036854775807 && val != -9223372036854775808 {
+					if in.Flags&bytecode.FlagDiscard != 0 {
+						if op == bytecode.OpPreIncCV || op == bytecode.OpPostIncCV {
+							slotPtr.Scalar = uint64(val + 1)
+						} else {
+							slotPtr.Scalar = uint64(val - 1)
+						}
+						fr.pc++
+						continue
+					}
+					if fr.evalTop < fr.evalBase+fr.fn.MaxStack {
+						switch op {
+						case bytecode.OpPreIncCV:
+							slotPtr.Scalar = uint64(val + 1)
+							vm.slots[fr.evalTop] = *slotPtr
+						case bytecode.OpPostIncCV:
+							vm.slots[fr.evalTop] = *slotPtr
+							slotPtr.Scalar = uint64(val + 1)
+						case bytecode.OpPreDecCV:
+							slotPtr.Scalar = uint64(val - 1)
+							vm.slots[fr.evalTop] = *slotPtr
+						default:
+							vm.slots[fr.evalTop] = *slotPtr
+							slotPtr.Scalar = uint64(val - 1)
+						}
+						fr.evalTop++
+						fr.pc++
+						continue
 					}
 				}
-			case 45: // fiber_is_running
-				if len(args) >= 1 && args[0].Type == types.TypeObject {
-					if fib, ok := vm.Fibers[args[0].Data]; ok {
-						res = types.NewBool(fib.State == FiberRunning)
-					} else {
-						res = types.NewBool(false)
-					}
-				}
-			case 46: // fiber_is_terminated
-				if len(args) >= 1 && args[0].Type == types.TypeObject {
-					if fib, ok := vm.Fibers[args[0].Data]; ok {
-						res = types.NewBool(fib.State == FiberTerminated)
-					} else {
-						res = types.NewBool(false)
-					}
-				}
-			case 50: // getenv
-				if len(args) >= 1 {
-					res = builtins.Getenv(args[0])
-				}
-			case 51: // putenv
-				if len(args) >= 1 {
-					res = builtins.Putenv(args[0])
-				}
-			case 52: // parse_dotenv
-				if len(args) >= 1 {
-					parsed := builtins.ParseDotenv(args[0].String())
-					res = types.NewLong(int64(len(parsed)))
-				}
-			case 53: // uuid_v4
-				res = builtins.UuidV4()
-			case 54: // uuid_v7
-				res = builtins.UuidV7()
-			case 55: // ulid
-				res = builtins.Ulid()
-			case 56: // monolog_log
-				if len(args) >= 2 {
-					name := types.NewString("app")
-					if len(args) >= 3 {
-						name = args[2]
-					}
-					res = builtins.LogMessage(args[0], args[1], name)
-				}
-			case 57: // curl_init
-				url := types.NewNull()
-				if len(args) >= 1 {
-					url = args[0]
-				}
-				res = builtins.CurlInit(url)
-			case 58: // curl_setopt
-				if len(args) >= 3 {
-					res = builtins.CurlSetopt(args[0], args[1], args[2])
-				}
-			case 59: // curl_exec
-				if len(args) >= 1 {
-					res = builtins.CurlExec(args[0])
-				}
-			case 60: // curl_getinfo
-				if len(args) >= 2 {
-					res = builtins.CurlGetinfo(args[0], args[1])
-				}
-			case 61: // curl_close
-				if len(args) >= 1 {
-					res = builtins.CurlClose(args[0])
-				}
-			case 62: // curl_error
-				if len(args) >= 1 {
-					res = builtins.CurlError(args[0])
-				}
-			case 63: // curl_errno
-				if len(args) >= 1 {
-					res = builtins.CurlErrno(args[0])
-				}
-			case 255: // Fallback Foreign Call
-				funcName := ""
-				if int(ins.C) < len(currentProg.StringPool) {
-					funcName = currentProg.StringPool[ins.C]
-				}
-				resVal, err := vm.DispatchFallbackForeignCall(funcName, args)
-				if err != nil {
-					return types.NewNull(), err
-				}
-				res = resVal
 			}
-
-			vm.Push(res)
-			pc++
-
-		// Sécurité & BlueTeam
-		case OpPregMatch:
-			txtVal := vm.Pop()
-			patVal := vm.Pop()
-			pat := patVal.Bytes()
-			txt := txtVal.Bytes()
-
-			var re c2pcre.C2_regex_t
-			c2pcre.C2_pcre_compile(pat, uint32(len(pat)), &re)
-			var m c2pcre.C2_match_t
-			matched := c2pcre.C2_pcre_exec(&re, txt, uint32(len(txt)), &m)
-			vm.Push(types.NewLong(int64(matched)))
-			pc++
-
-		case OpBlueteamEntropy:
-			val := vm.Pop()
-			b := val.Bytes()
-			entropyQ8 := c2blueteam.C2bt_calc_entropy_8_8(b, uint64(len(b)))
-			f := float64(entropyQ8) / 256.0
-			vm.Push(types.NewDouble(f))
-			pc++
-
-		case OpBlueteamClassify:
-			val := vm.Pop()
-			b := val.Bytes()
-			var entropyQ8 uint32
-			var charMask uint32
-			pClass := c2blueteam.C2bt_classify_payload(b, uint64(len(b)), &entropyQ8, &charMask)
-			vm.Push(types.NewLong(int64(pClass)))
-			pc++
-
-		case OpSecurityCheck:
-			val := vm.Pop()
-			sinkNameVal := vm.Pop()
-			if vm.Guard != nil {
-				if err := vm.Guard.CheckSink(sinkNameVal.String(), val); err != nil {
-					return types.NewNull(), err
-				}
-			}
-			pc++
-
-		// E/S & Sortie
-		case OpEcho, OpPrint:
-			val := vm.Pop()
-			buf := val.ToStringBuffered(vm.FormatBuf[:])
-			if vm.Guard != nil {
-				if err := vm.Guard.EgressInspect(buf); err != nil {
-					return types.NewNull(), err
-				}
-			}
-			if len(vm.OutputBuffers) > 0 {
-				vm.OutputBuffers[len(vm.OutputBuffers)-1] = append(vm.OutputBuffers[len(vm.OutputBuffers)-1], buf...)
-			} else if vm.Output != nil {
-				vm.Output.Write(buf)
-			}
-			if ins.Op == OpPrint {
-				vm.Push(types.NewLong(1))
-			}
-			pc++
-
-		case OpSilenceBegin:
-			vm.SilenceLevel++
-			pc++
-
-		case OpSilenceEnd:
-			if vm.SilenceLevel > 0 {
-				vm.SilenceLevel--
-			}
-			pc++
-
-		case OpReturn:
-			if vm.SP > 0 {
-				return vm.Pop(), nil
-			}
-			return types.NewNull(), nil
-
+			vm.opInc(op, in.Op1, in.Flags)
+		case bytecode.OpJmpNull:
+			vm.opJmpNull(int(in.Op1))
+		case bytecode.OpSwitchLong, bytecode.OpSwitchString, bytecode.OpMatch:
+			vm.opSwitch(op, in)
+		case bytecode.OpReturn:
+			vm.opReturn(in)
+		case bytecode.OpExit:
+			vm.opExit(in)
+		case bytecode.OpInitArray:
+			vm.opInitArray()
+		case bytecode.OpAddArrayElement:
+			vm.opAddElem(true, in)
+		case bytecode.OpAppendArrayElement:
+			vm.opAddElem(false, in)
+		case bytecode.OpFetchDimR, bytecode.OpFetchDimW, bytecode.OpFetchDimIs:
+			vm.opFetchDim(op)
+		case bytecode.OpAssignDim, bytecode.OpAssignDimOp:
+			vm.opAssignDim(op, in)
+		case bytecode.OpUnsetDim:
+			vm.opUnsetDim()
+		case bytecode.OpIssetDim, bytecode.OpEmptyDim:
+			vm.opIssetDim(op == bytecode.OpEmptyDim)
+		case bytecode.OpFeResetR, bytecode.OpFeResetRW, bytecode.OpFeFetchR, bytecode.OpFeFetchRW, bytecode.OpFeFree:
+			vm.opForeach(op, in)
+		case bytecode.OpInitCall, bytecode.OpInitMethodCall, bytecode.OpInitStaticMethodCall, bytecode.OpInitNew:
+			vm.opInit(op, in)
+		case bytecode.OpSendVal, bytecode.OpSendRef:
+			vm.opSend(op == bytecode.OpSendRef)
+		case bytecode.OpSendNamed:
+			vm.opSendNamed(in.Op1)
+		case bytecode.OpSendUnpack:
+			vm.opSendUnpack()
+		case bytecode.OpDoCall:
+			vm.opDoCall()
+		case bytecode.OpBindClosure:
+			vm.opBindClosure(in)
+		case bytecode.OpFetchPropR, bytecode.OpFetchPropW:
+			vm.opFetchProp(op, in.Op1, in.Flags)
+		case bytecode.OpAssignProp, bytecode.OpAssignPropOp:
+			vm.opAssignProp(op, in)
+		case bytecode.OpUnsetProp, bytecode.OpIssetProp, bytecode.OpEmptyProp:
+			vm.opPropQuery(op, in.Op1)
+		case bytecode.OpFetchStaticPropR:
+			vm.opStaticProp(false, in)
+		case bytecode.OpAssignStaticProp:
+			vm.opStaticProp(true, in)
+		case bytecode.OpFetchClassConst:
+			vm.opClassConst(in)
+		case bytecode.OpInstanceof:
+			vm.opInstanceof(in.Op1)
+		case bytecode.OpClone:
+			vm.opClone()
+		case bytecode.OpThrow:
+			v := vm.pop()
+			vm.excTrace = nil
+			vm.throwAt(vm.frame().pc, v)
+		case bytecode.OpEnterCatch:
+			vm.opEnterCatch(in.Op1)
+		case bytecode.OpLeaveFinally, bytecode.OpFastRetFinally:
+			vm.finishFinally()
+		case bytecode.OpFastCallFinally:
+			vm.fastCallFinally(int(in.Op1), int(in.Op2))
 		default:
-			return types.NewNull(), fmt.Errorf("opcode inconnu: %d", ins.Op)
+			vm.fatalFeature(op.String())
 		}
 	}
-
-	if vm.SP > 0 {
-		return vm.Pop(), nil
-	}
-	return types.NewNull(), nil
-}
-
-func (vm *VM) isNativeClass(name string) bool {
-	return strings.EqualFold(name, "PDO") || strings.EqualFold(name, "PDOStatement")
-}
-
-func (vm *VM) allocObjectIdxByName(name string) int {
-	clsLower := strings.ToLower(name)
-	clsIdx := 0
-	if idx, ok := vm.ClassMap[clsLower]; ok {
-		clsIdx = int(idx)
-	}
-	if vm.NextObject >= len(vm.Objects) {
-		newObjects := make([]ObjectInstance, len(vm.Objects)*2)
-		copy(newObjects, vm.Objects)
-		vm.Objects = newObjects
-	}
-	objIdx := vm.NextObject
-	vm.NextObject++
-	obj := &vm.Objects[objIdx]
-	obj.ClassIdx = uint16(clsIdx)
-	obj.ClassName = name
-	if clsIdx < len(vm.Classes) {
-		cls := &vm.Classes[clsIdx]
-		if len(cls.PropDefaults) > len(obj.PropsBuf) {
-			obj.Props = make([]types.Value, len(cls.PropDefaults))
-		} else {
-			obj.Props = obj.PropsBuf[:len(cls.PropDefaults)]
-		}
-		for pIdx, defVal := range cls.PropDefaults {
-			obj.Props[pIdx] = defVal
-		}
-	}
-	return objIdx
-}
-
-func (vm *VM) newArrayFromRow(row pdo.TableRow, selectedCols []string) types.Value {
-	if vm.NextTable < len(vm.SwissTables) {
-		tIdx := vm.NextTable
-		vm.NextTable++
-		ht := &vm.SwissTables[tIdx]
-		c2ordered_swiss.Swiss_init(
-			ht,
-			vm.SwissCtrl[tIdx][:],
-			vm.SwissSlots[tIdx][:],
-			vm.SwissElems[tIdx][:],
-			64,
-			64,
-		)
-		var orderedCols []string
-		if len(selectedCols) > 0 {
-			orderedCols = selectedCols
-		} else {
-			for k := range row {
-				orderedCols = append(orderedCols, k)
-			}
-			sort.Strings(orderedCols)
-		}
-
-		idx := int64(0)
-		for _, col := range orderedCols {
-			if v, ok := row[col]; ok {
-				if idx < 64 {
-					c2ordered_swiss.Swiss_insert_packed_int(ht, idx, uint32(v.Type), idx)
-					vm.SwissValues[tIdx][idx] = v
-					idx++
-				}
-			}
-		}
-		return types.Value{
-			Type: types.TypeArray,
-			Data: int64(tIdx),
-			Len:  ht.N_elements,
-		}
-	}
-	return types.NewNull()
-}
-
-func (vm *VM) newArrayFromRows(rows []pdo.TableRow, selectedCols []string) types.Value {
-	if vm.NextTable < len(vm.SwissTables) {
-		tIdx := vm.NextTable
-		vm.NextTable++
-		ht := &vm.SwissTables[tIdx]
-		c2ordered_swiss.Swiss_init(
-			ht,
-			vm.SwissCtrl[tIdx][:],
-			vm.SwissSlots[tIdx][:],
-			vm.SwissElems[tIdx][:],
-			64,
-			64,
-		)
-		for i, r := range rows {
-			if i < 64 {
-				rArr := vm.newArrayFromRow(r, selectedCols)
-				c2ordered_swiss.Swiss_insert_packed_int(ht, int64(i), uint32(rArr.Type), int64(i))
-				vm.SwissValues[tIdx][i] = rArr
-			}
-		}
-		return types.Value{
-			Type: types.TypeArray,
-			Data: int64(tIdx),
-			Len:  ht.N_elements,
-		}
-	}
-	return types.NewNull()
-}
-
-func (vm *VM) dispatchNativeMethod(obj *ObjectInstance, funcIdx int, targetIdx int, numArgs int) types.Value {
-	args := make([]types.Value, numArgs)
-	for i := 0; i < numArgs; i++ {
-		args[i] = vm.Stack[targetIdx+1+i]
-	}
-
-	cls := vm.Classes[obj.ClassIdx]
-	var methodName string
-	for mName, fIdx := range cls.Methods {
-		if int(fIdx) == funcIdx {
-			methodName = mName
-			break
-		}
-	}
-
-	if strings.EqualFold(obj.ClassName, "PDO") {
-		pId := obj.Props[0].ToLong()
-		p, ok := pdo.GetPDOInstance(pId)
-		if !ok || p == nil {
-			return types.NewNull()
-		}
-
-		switch strings.ToLower(methodName) {
-		case "exec":
-			if len(args) > 0 {
-				n, _ := p.Exec(args[0].String(), args[1:]...)
-				return types.NewLong(n)
-			}
-		case "query":
-			if len(args) > 0 {
-				stmt, err := p.Query(args[0].String(), args[1:]...)
-				if err != nil || stmt == nil {
-					return types.NewBool(false)
-				}
-				sId := pdo.RegisterStmtInstance(stmt)
-				stmtObjIdx := vm.allocObjectIdxByName("PDOStatement")
-				vm.Objects[stmtObjIdx].Props[0] = types.NewLong(sId)
-				return types.Value{Type: types.TypeObject, Data: int64(stmtObjIdx)}
-			}
-		case "prepare":
-			if len(args) > 0 {
-				stmt, err := p.Prepare(args[0].String())
-				if err != nil || stmt == nil {
-					return types.NewBool(false)
-				}
-				sId := pdo.RegisterStmtInstance(stmt)
-				stmtObjIdx := vm.allocObjectIdxByName("PDOStatement")
-				vm.Objects[stmtObjIdx].Props[0] = types.NewLong(sId)
-				return types.Value{Type: types.TypeObject, Data: int64(stmtObjIdx)}
-			}
-		case "begintransaction":
-			_ = p.BeginTransaction()
-			return types.NewBool(true)
-		case "commit":
-			_ = p.Commit()
-			return types.NewBool(true)
-		case "rollback":
-			_ = p.RollBack()
-			return types.NewBool(true)
-		case "intransaction":
-			return types.NewBool(p.InTransaction())
-		case "lastinsertid":
-			return types.NewLong(p.LastInsertId())
-		case "setattribute":
-			if len(args) >= 2 {
-				p.SetAttribute(int(args[0].ToLong()), args[1])
-				return types.NewBool(true)
-			}
-		case "getattribute":
-			if len(args) >= 1 {
-				return p.GetAttribute(int(args[0].ToLong()))
-			}
-		}
-	}
-
-	if strings.EqualFold(obj.ClassName, "PDOStatement") {
-		sId := obj.Props[0].ToLong()
-		stmt, ok := pdo.GetStmtInstance(sId)
-		if !ok || stmt == nil {
-			return types.NewNull()
-		}
-
-		switch strings.ToLower(methodName) {
-		case "execute":
-			var execArgs []types.Value
-			if len(args) > 0 {
-				if args[0].Type == types.TypeArray {
-					tIdx := int(args[0].Data)
-					if tIdx < len(vm.SwissTables) {
-						ht := &vm.SwissTables[tIdx]
-						for i := 0; i < int(ht.N_elements); i++ {
-							execArgs = append(execArgs, vm.SwissValues[tIdx][i])
-						}
-					}
-				} else {
-					execArgs = args
-				}
-			}
-			ok, _ := stmt.Execute(execArgs)
-			return types.NewBool(ok)
-
-		case "fetch":
-			row, found := stmt.Fetch()
-			if !found {
-				return types.NewBool(false)
-			}
-			return vm.newArrayFromRow(row, stmt.SelectedCols())
-
-		case "fetchall":
-			rows := stmt.FetchAll()
-			return vm.newArrayFromRows(rows, stmt.SelectedCols())
-
-		case "fetchcolumn":
-			col := 0
-			if len(args) > 0 {
-				col = int(args[0].ToLong())
-			}
-			val, found := stmt.FetchColumn(col)
-			if !found {
-				return types.NewBool(false)
-			}
-			return val
-
-		case "rowcount":
-			return types.NewLong(int64(stmt.RowCount()))
-
-		case "bindvalue":
-			if len(args) >= 2 {
-				stmt.BindValue(args[0].String(), args[1])
-				return types.NewBool(true)
-			}
-
-		case "closecursor":
-			stmt.CloseCursor()
-			return types.NewBool(true)
-		}
-	}
-
-	return types.NewNull()
-}
-
-// DispatchFallbackForeignCall gère la délégation sécurisée des fonctions PHP externes
-func (vm *VM) DispatchFallbackForeignCall(funcName string, args []types.Value) (types.Value, error) {
-	// 1. Gate d'entrée : Vérification de sécurité (Taint & Puits sensibles)
-	if vm.Guard != nil {
-		if err := vm.Guard.CheckForeignSink(funcName, args); err != nil {
-			return types.NewNull(), err
-		}
-	}
-
-	if vm.ForeignPool == nil {
-		vm.ForeignPool = foreign.NewMockWorkerPool()
-	}
-
-	// 2. Exécution dans le pool externe
-	resVal, err := vm.ForeignPool.Call(funcName, args)
-	if err != nil {
-		return types.NewNull(), err
-	}
-
-	// 3. Gate de sortie : Egress Inspect sur données renvoyées
-	if vm.Guard != nil && resVal.Type == types.TypeString {
-		if err := vm.Guard.EgressInspect(resVal.Bytes()); err != nil {
-			return types.NewNull(), err
-		}
-	}
-
-	return resVal, nil
 }

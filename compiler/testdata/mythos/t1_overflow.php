@@ -1,0 +1,20 @@
+<?php
+$a = PHP_INT_MAX; $b = 1;
+$c = $a + $b; var_dump($c);
+$d = $a * 2; var_dump($d);
+$e = PHP_INT_MIN; $f = $e - $b; var_dump($f);
+$i = PHP_INT_MAX; $i++; var_dump($i);
+$j = PHP_INT_MIN; $j--; var_dump($j);
+$k = PHP_INT_MAX; $k += 1; var_dump($k);
+$m = -1; $n = PHP_INT_MIN; $p = $m * $n; var_dump($p);
+$x = PHP_INT_MAX; $y = 1;
+$x = $x + $y; var_dump($x); $x = $x + $y; var_dump($x);
+$s = 0; for ($q = 0; $q < 5; $q++) { $s = $s + $q; } var_dump($s);
+$t = 9223372036854775000; for ($q = 0; $q < 2000; $q++) { $t = $t + 1; } var_dump($t);
+$u = 9223372036854775000; for ($q = 0; $q < 2000; $q++) { $u++; } var_dump($u);
+$w = PHP_INT_MAX - 5; $cnt = 0; while ($w < PHP_INT_MAX) { $w = $w + 1; $cnt++; } var_dump($cnt, $w);
+var_dump(1 << 63, 1 << 64, -8 >> 1, PHP_INT_MIN >> 63, 5 >> 64, 5 << 64, -5 >> 64, -5 >> 65);
+$sh = 64; var_dump(1 << $sh, -5 >> $sh, 1 << 63);
+var_dump(PHP_INT_MAX * PHP_INT_MAX, PHP_INT_MIN * -1, PHP_INT_MIN - 1, -PHP_INT_MIN);
+$aa = 3000000000; $bb = 4000000000; $cc = $aa * $bb; var_dump($cc);
+$dd = 3037000500; $ee = $dd * $dd; var_dump($ee);

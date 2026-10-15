@@ -1,281 +1,295 @@
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-
 package types
 
 import (
+	"fmt"
 	"math"
+	"os/exec"
+	"reflect"
+	"strings"
 	"testing"
 	"unsafe"
 )
 
-func TestValueSizeInvariant(t *testing.T) {
-	sz := unsafe.Sizeof(Value{})
-	if sz != 24 {
-		t.Fatalf("Taille struct Value = %d octets, invariant dur = 24 octets (3 mots 64-bit)", sz)
+func TestValueLayout(t *testing.T) {
+	if unsafe.Sizeof(Value{}) != 16 || unsafe.Alignof(Value{}) != 8 {
+		t.Fatalf("size=%d align=%d", unsafe.Sizeof(Value{}), unsafe.Alignof(Value{}))
+	}
+	typ := reflect.TypeFor[Value]()
+	wantNames := []string{"Type", "Flags", "Extra", "DataSlot", "Scalar"}
+	wantKinds := []reflect.Kind{reflect.Uint8, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64}
+	wantOffsets := []uintptr{0, 1, 2, 4, 8}
+	if typ.NumField() != len(wantNames) {
+		t.Fatalf("fields=%d", typ.NumField())
+	}
+	for i, name := range wantNames {
+		field := typ.Field(i)
+		if field.Name != name || field.Type.Kind() != wantKinds[i] || field.Offset != wantOffsets[i] {
+			t.Errorf("field %d: %+v", i, field)
+		}
+	}
+	for i, tag := range []Type{TypeUndef, TypeNull, TypeFalse, TypeTrue, TypeLong, TypeDouble, TypeString, TypeArray, TypeObject, TypeResource, TypeReference} {
+		if tag != Type(i) {
+			t.Errorf("tag %d = %d", i, tag)
+		}
+	}
+	for i, flag := range []Flags{FlagZoneRequest, FlagTainted, FlagOwnedMutable, FlagImmutable} {
+		if flag != Flags(1<<i) {
+			t.Errorf("flag %d = %d", i, flag)
+		}
 	}
 }
 
-func TestValueArithmeticOverflow(t *testing.T) {
-	// Normal int addition
-	v1 := NewLong(100)
-	v2 := NewLong(200)
-	res := Add(v1, v2)
-	if res.Type != TypeLong || res.ToLong() != 300 {
-		t.Fatalf("100 + 200: got %v (type %d), want 300", res.ToLong(), res.Type)
+func TestConstructorsAndPredicates(t *testing.T) {
+	values := []Value{NewUndef(), NewNull(), NewBool(false), NewBool(true), NewLong(-42), NewDouble(math.Copysign(0, -1))}
+	for i, v := range values {
+		if v.Type != Type(i) || v.Flags != 0 || v.Extra != 0 || v.DataSlot != 0 {
+			t.Errorf("constructor %d: %+v", i, v)
+		}
+		got := []bool{v.IsUndef(), v.IsNull(), v.IsBool(), v.IsLong(), v.IsDouble()}
+		want := []bool{i == 0, i == 1, i == 2 || i == 3, i == 4, i == 5}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("predicates %d: %v, want %v", i, got, want)
+		}
+		if i < 4 && v.Scalar != 0 {
+			t.Errorf("nonzero payload: %+v", v)
+		}
 	}
-
-	// Overflow int addition -> Double
-	maxInt := NewLong(math.MaxInt64)
-	one := NewLong(1)
-	resOverflow := Add(maxInt, one)
-	if resOverflow.Type != TypeDouble {
-		t.Fatalf("MaxInt64 + 1: attendu TypeDouble, got %d", resOverflow.Type)
+	if values[4].Scalar != math.MaxUint64-41 || values[5].Scalar != 1<<63 {
+		t.Fatal("scalar bits were not preserved")
 	}
-	expectedFloat := float64(math.MaxInt64) + 1.0
-	if math.Abs(resOverflow.ToDouble()-expectedFloat) > 1.0 {
-		t.Fatalf("MaxInt64 + 1 double value: got %f, want %f", resOverflow.ToDouble(), expectedFloat)
+	if (Value{}) != NewUndef() || Identical(NewUndef(), NewNull()) || !Identical(NewUndef(), NewUndef()) {
+		t.Fatal("undefined tag must remain distinct from null")
 	}
-}
-
-func TestValueCoercionPHP84(t *testing.T) {
-	// Booleans
-	if NewString("").ToBool() != false {
-		t.Fatalf("empty string to bool should be false")
+	if !Identical(Value{Type: TypeNull, Scalar: 1}, NewNull()) {
+		t.Fatal("scalar payload must be ignored for null in Identical")
 	}
-	if NewString("0").ToBool() != false {
-		t.Fatalf("\"0\" to bool should be false")
+	if !Identical(Value{Type: TypeTrue, Scalar: 7}, NewBool(true)) {
+		t.Fatal("scalar payload must be ignored for bool in Identical")
 	}
-	if NewString("1").ToBool() != true {
-		t.Fatalf("\"1\" to bool should be true")
-	}
-	if NewString("foo").ToBool() != true {
-		t.Fatalf("\"foo\" to bool should be true")
-	}
-
-	// Longs
-	if NewString("42").ToLong() != 42 {
-		t.Fatalf("\"42\" to long should be 42")
-	}
-	if NewDouble(3.14).ToLong() != 3 {
-		t.Fatalf("3.14 to long should be 3")
+	v := NewLong(42)
+	v.Flags, v.Extra, v.DataSlot = FlagTainted, 17, 23
+	if !Identical(v, NewLong(42)) || CompareScalaires(v, NewLong(42)) != 0 {
+		t.Fatal("metadata must not affect scalar comparisons")
 	}
 }
 
-func TestValuePosSIMD(t *testing.T) {
-	haystack := NewString("PHP 127 Flatstack Sovereign Engine")
-	needle := NewString("Flatstack")
-	pos := haystack.Pos(needle)
-	if pos != 8 {
-		t.Fatalf("Pos(\"Flatstack\") = %d, attendu 8", pos)
-	}
+type scalarCase struct {
+	v   Value
+	php string
+}
 
-	notFound := haystack.Pos(NewString("Missing"))
-	if notFound != -1 {
-		t.Fatalf("Pos(\"Missing\") = %d, attendu -1", notFound)
+func scalarCases() []scalarCase {
+	// Reading an undefined PHP variable yields null; ?? avoids its diagnostic.
+	cases := []scalarCase{{NewUndef(), "($undefined ?? null)"}, {NewNull(), "null"}, {NewBool(false), "false"}, {NewBool(true), "true"}}
+	for _, n := range []int64{math.MinInt64, math.MinInt64 + 1, -3037000500, -3037000499, -3, -2, -1, 0, 1, 2, 3, 3037000499, 3037000500, 1<<53 - 1, 1<<53 + 1, math.MaxInt64 - 1, math.MaxInt64} {
+		expr := fmt.Sprintf("%d", n)
+		if n == math.MinInt64 {
+			expr = "PHP_INT_MIN"
+		}
+		cases = append(cases, scalarCase{NewLong(n), expr})
+	}
+	for _, f := range []float64{0, math.Copysign(0, -1), 1, -1, 1.75, -1.75, math.SmallestNonzeroFloat64, -math.SmallestNonzeroFloat64, math.Nextafter(0x1p63, 0), 0x1p63, math.Nextafter(0x1p63, math.Inf(1)), -0x1p63, math.Nextafter(-0x1p63, math.Inf(-1)), math.Nextafter(0x1p64, 0), 0x1p64, -0x1p64, 1e30, -1e30, math.MaxFloat64, -math.MaxFloat64, math.Inf(1), math.Inf(-1), math.NaN()} {
+		cases = append(cases, scalarCase{NewDouble(f), fmt.Sprintf("unpack('E', hex2bin('%016x'))[1]", math.Float64bits(f))})
+	}
+	return cases
+}
+
+func encodeScalar(v Value) string {
+	switch v.Type {
+	case TypeLong:
+		return fmt.Sprintf("i:%d", int64(v.Scalar))
+	case TypeDouble:
+		if math.IsNaN(math.Float64frombits(v.Scalar)) {
+			return "d:nan"
+		}
+		return fmt.Sprintf("d:%016x", v.Scalar)
+	case TypeTrue:
+		return "b:1"
+	case TypeFalse:
+		return "b:0"
+	default:
+		panic("unexpected oracle result")
 	}
 }
 
-func TestValueZeroAllocArith(t *testing.T) {
-	v1 := NewLong(12345)
-	v2 := NewLong(67890)
+func TestPHPScalarDifferential(t *testing.T) {
+	version, err := exec.CommandContext(t.Context(), "/usr/bin/php", "-r", "echo PHP_VERSION, ':', PHP_INT_SIZE;").CombinedOutput()
+	if err != nil || string(version) != "8.3.6:8" {
+		t.Fatalf("PHP oracle: %q, error=%v", version, err)
+	}
+	var script strings.Builder
+	script.WriteString(`function enc($v) {
+if (is_int($v)) return 'i:'.$v;
+if (is_float($v)) return is_nan($v) ? 'd:nan' : 'd:'.bin2hex(pack('E', $v));
+if (is_bool($v)) return $v ? 'b:1' : 'b:0';
+throw new Exception('unexpected oracle result');
+}
+$v = [`)
+	cases := scalarCases()
+	for _, c := range cases {
+		script.WriteString(c.php + ",")
+	}
+	script.WriteString("];\n")
+	var want strings.Builder
+	for i, a := range cases {
+		for _, conv := range []struct {
+			name   string
+			result Value
+		}{
+			{"bool", NewBool(a.v.ToBool())}, {"int", NewLong(a.v.ToLong())}, {"float", NewDouble(a.v.ToDouble())},
+		} {
+			label := fmt.Sprintf("%s(%d)", conv.name, i)
+			fmt.Fprintf(&script, "echo '%s=',enc((%s)$v[%d]),\"\\n\";\n", label, conv.name, i)
+			fmt.Fprintf(&want, "%s=%s\n", label, encodeScalar(conv.result))
+		}
+		for j, b := range cases {
+			fmt.Fprintf(&script, "echo 'cmp(%d,%d)=',enc($v[%d]<=>$v[%d]),\"\\n\";\n", i, j, i, j)
+			fmt.Fprintf(&want, "cmp(%d,%d)=%s\n", i, j, encodeScalar(NewLong(int64(CompareScalaires(a.v, b.v)))))
+			// Undef is an internal tag, not a distinct PHP expression value.
+			if i != 0 && j != 0 {
+				fmt.Fprintf(&script, "echo 'same(%d,%d)=',enc($v[%d]===$v[%d]),\"\\n\";\n", i, j, i, j)
+				fmt.Fprintf(&want, "same(%d,%d)=%s\n", i, j, encodeScalar(NewBool(Identical(a.v, b.v))))
+			}
+			if a.v.Type < TypeLong || b.v.Type < TypeLong {
+				continue
+			}
+			for _, op := range []struct {
+				name string
+				fn   func(Value, Value) Value
+			}{{"+", Add}, {"-", Sub}, {"*", Mul}} {
+				fmt.Fprintf(&script, "echo '%s(%d,%d)=',enc($v[%d]%s$v[%d]),\"\\n\";\n", op.name, i, j, i, op.name, j)
+				fmt.Fprintf(&want, "%s(%d,%d)=%s\n", op.name, i, j, encodeScalar(op.fn(a.v, b.v)))
+			}
+			fmt.Fprintf(&script, "try { echo '/(%d,%d)=',enc($v[%d]/$v[%d]),\"\\n\"; } catch (DivisionByZeroError $e) { echo get_class($e),':',$e->getMessage(),\"\\n\"; }\n", i, j, i, j)
+			result, divErr := Div(a.v, b.v)
+			if divErr != nil {
+				if _, ok := divErr.(DivisionByZeroError); !ok || result != NewUndef() {
+					t.Fatalf("division result=%+v error=%T", result, divErr)
+				}
+				fmt.Fprintf(&want, "/(%d,%d)=DivisionByZeroError:%s\n", i, j, divErr)
+			} else {
+				fmt.Fprintf(&want, "/(%d,%d)=%s\n", i, j, encodeScalar(result))
+			}
+		}
+	}
+	// Supply the program on stdin to avoid the operating system's argument limit.
+	cmd := exec.CommandContext(t.Context(), "/usr/bin/php")
+	cmd.Stdin = strings.NewReader("<?php\n" + script.String())
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PHP failed: %v\n%s", err, output)
+	}
+	actualLines, expectedLines := strings.Split(string(output), "\n"), strings.Split(want.String(), "\n")
+	if len(actualLines) != len(expectedLines) {
+		t.Fatalf("PHP produced %d lines, want %d\n%s", len(actualLines), len(expectedLines), output)
+	}
+	for i, expected := range expectedLines {
+		if actualLines[i] != expected {
+			t.Errorf("oracle line %d: PHP %q; Go %q", i+1, actualLines[i], expected)
+		}
+	}
+	t.Logf("PHP %s: %d scalar cases, %d differential results", version, len(cases), len(expectedLines)-1)
+}
 
-	allocs := testing.AllocsPerRun(1000, func() {
-		_ = Add(v1, v2)
-		_ = Sub(v2, v1)
-		_ = Mul(v1, v2)
-		_ = Div(v2, v1)
-		_ = Mod(v2, v1)
-		_ = BitAnd(v1, v2)
-		_ = BitOr(v1, v2)
-		_ = BitXor(v1, v2)
-		_ = BitNot(v1)
-		_ = ShiftLeft(v1, NewLong(2))
-		_ = ShiftRight(v1, NewLong(2))
-		_ = Equal(v1, v2)
-		_ = Identical(v1, v2)
-		_ = Compare(v1, v2)
-	})
-	if allocs != 0 {
-		t.Fatalf("Allocs/op = %.2f, attendu 0", allocs)
+func TestUnsupportedTypesPanic(t *testing.T) {
+	for tag := TypeString; tag <= TypeReference+1; tag++ {
+		v := Value{Type: tag}
+		for name, fn := range map[string]func(){
+			"bool": func() { v.ToBool() }, "long": func() { v.ToLong() }, "double": func() { v.ToDouble() },
+			"add-left": func() { Add(v, NewLong(1)) }, "add-right": func() { Add(NewLong(1), v) },
+			"sub-left": func() { Sub(v, NewLong(1)) }, "sub-right": func() { Sub(NewLong(1), v) },
+			"mul-left": func() { Mul(v, NewLong(1)) }, "mul-right": func() { Mul(NewLong(1), v) },
+			"div-left": func() { Div(v, NewLong(1)) }, "div-right": func() { Div(NewLong(1), v) },
+			"same-left": func() { Identical(v, NewLong(1)) }, "same-right": func() { Identical(NewLong(1), v) },
+			"cmp-left": func() { CompareScalaires(v, NewLong(1)) }, "cmp-right": func() { CompareScalaires(NewLong(1), v) },
+		} {
+			t.Run(fmt.Sprintf("%d/%s", tag, name), func(t *testing.T) {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("unsupported type accepted")
+					}
+				}()
+				fn()
+			})
+		}
+	}
+	for _, v := range []Value{NewUndef(), NewNull(), NewBool(false), NewBool(true)} {
+		for _, fn := range []func(Value, Value) Value{Add, Sub, Mul, func(a, b Value) Value { result, _ := Div(a, b); return result }} {
+			for _, reverse := range []bool{false, true} {
+				func() {
+					defer func() {
+						if recover() == nil {
+							t.Errorf("arithmetic accepted tag %d", v.Type)
+						}
+					}()
+					if reverse {
+						fn(NewLong(1), v)
+					} else {
+						fn(v, NewLong(1))
+					}
+				}()
+			}
+		}
 	}
 }
 
-func TestValueComparisons(t *testing.T) {
-	a := NewLong(10)
-	b := NewLong(20)
-	c := NewLong(10)
-	s10 := NewString("10")
-	s20 := NewString("20")
-	sFoo := NewString("foo")
+var valueSink Value
+var boolSink bool
+var longSink int64
+var doubleSink float64
+var compareSink int
+var errorSink error
 
-	// Equal
-	if !Equal(a, c) {
-		t.Fatalf("Equal(10, 10) should be true")
-	}
-	if Equal(a, b) {
-		t.Fatalf("Equal(10, 20) should be false")
-	}
-	if !Equal(a, s10) {
-		t.Fatalf("Equal(10, \"10\") should be true in PHP 8.4")
-	}
-	if Equal(a, sFoo) {
-		t.Fatalf("Equal(10, \"foo\") should be false in PHP 8.4")
-	}
+func scalarOperations(a, b Value) {
+	valueSink = NewUndef()
+	valueSink = NewNull()
+	valueSink = NewBool(a.ToBool())
+	valueSink = NewLong(a.ToLong())
+	valueSink = NewDouble(a.ToDouble())
+	boolSink = a.IsUndef()
+	boolSink = a.IsNull()
+	boolSink = a.IsBool()
+	boolSink = a.IsLong()
+	boolSink = a.IsDouble()
+	boolSink = a.ToBool()
+	longSink = a.ToLong()
+	doubleSink = a.ToDouble()
+	valueSink = Add(a, b)
+	valueSink = Sub(a, b)
+	valueSink = Mul(a, b)
+	valueSink, errorSink = Div(a, b)
+	boolSink = Identical(a, b)
+	compareSink = CompareScalaires(a, b)
+}
 
-	// Identical
-	if !Identical(a, c) {
-		t.Fatalf("Identical(10, 10) should be true")
-	}
-	if Identical(a, s10) {
-		t.Fatalf("Identical(10, \"10\") should be false (different types)")
-	}
-
-	// Compare (Spaceship)
-	if Compare(a, b) != -1 {
-		t.Fatalf("Compare(10, 20) should be -1")
-	}
-	if Compare(b, a) != 1 {
-		t.Fatalf("Compare(20, 10) should be 1")
-	}
-	if Compare(a, c) != 0 {
-		t.Fatalf("Compare(10, 10) should be 0")
-	}
-	if Compare(s10, s20) != -1 {
-		t.Fatalf("Compare(\"10\", \"20\") should be -1")
-	}
-
-	// Inégalités
-	if !Lt(a, b) || !Lte(a, b) || !Lte(a, c) {
-		t.Fatalf("Lt/Lte checks failed for 10 < 20")
-	}
-	if !Gt(b, a) || !Gte(b, a) || !Gte(a, c) {
-		t.Fatalf("Gt/Gte checks failed for 20 > 10")
+func TestScalarAllocations(t *testing.T) {
+	for _, a := range scalarCases() {
+		for _, b := range scalarCases() {
+			if a.v.Type < TypeLong || b.v.Type < TypeLong {
+				continue
+			}
+			if allocs := testing.AllocsPerRun(10, func() { scalarOperations(a.v, b.v) }); allocs != 0 {
+				t.Fatalf("%s, %s: %g allocations", a.php, b.php, allocs)
+			}
+		}
 	}
 }
 
-func TestValueBitwiseAndMath(t *testing.T) {
-	v1 := NewLong(0b1100)
-	v2 := NewLong(0b1010)
-
-	if BitAnd(v1, v2).ToLong() != 0b1000 {
-		t.Fatalf("BitAnd failed")
-	}
-	if BitOr(v1, v2).ToLong() != 0b1110 {
-		t.Fatalf("BitOr failed")
-	}
-	if BitXor(v1, v2).ToLong() != 0b0110 {
-		t.Fatalf("BitXor failed")
-	}
-	if BitNot(NewLong(0)).ToLong() != -1 {
-		t.Fatalf("BitNot failed")
-	}
-	if ShiftLeft(NewLong(1), NewLong(3)).ToLong() != 8 {
-		t.Fatalf("ShiftLeft failed")
-	}
-	if ShiftRight(NewLong(16), NewLong(2)).ToLong() != 4 {
-		t.Fatalf("ShiftRight failed")
-	}
-
-	// Mod & Pow & Neg & Not
-	if Mod(NewLong(17), NewLong(5)).ToLong() != 2 {
-		t.Fatalf("Mod failed")
-	}
-	if Pow(NewLong(2), NewLong(8)).ToLong() != 256 {
-		t.Fatalf("Pow failed")
-	}
-	if Neg(NewLong(42)).ToLong() != -42 {
-		t.Fatalf("Neg failed")
-	}
-	if Not(NewBool(true)).ToBool() != false {
-		t.Fatalf("Not failed")
-	}
-}
-
-func TestValueTaintPropagation(t *testing.T) {
-	clean := NewLong(10)
-	tainted := NewLong(20).WithTaint(FlagTaintedUserInput)
-
-	// Arithmetics inherit taint
-	resAdd := Add(clean, tainted)
-	if !resAdd.IsTainted() {
-		t.Fatalf("Add(clean, tainted) should be tainted")
-	}
-
-	resMul := Mul(tainted, clean)
-	if !resMul.IsTainted() {
-		t.Fatalf("Mul(tainted, clean) should be tainted")
-	}
-
-	// Concat inherits taint
-	var buf [64]byte
-	strClean := NewString("hello ")
-	strTainted := NewString("world").WithTaint(FlagTaintedUserInput)
-	resConcat := Concat(strClean, strTainted, buf[:])
-	if !resConcat.IsTainted() {
-		t.Fatalf("Concat(clean, tainted) should be tainted")
-	}
-
-	// Bitwise inherits taint
-	resBit := BitOr(clean, tainted)
-	if !resBit.IsTainted() {
-		t.Fatalf("BitOr(clean, tainted) should be tainted")
-	}
-}
-
-func TestAdversarialSignedArithmeticAndCoercion(t *testing.T) {
-	// 1. Signed negative arithmetic stays integer
-	vAdd := Add(NewLong(-1), NewLong(-1))
-	if vAdd.Type != TypeLong || vAdd.ToLong() != -2 {
-		t.Fatalf("Add(-1, -1) got %v (type %d), want -2", vAdd.ToLong(), vAdd.Type)
-	}
-
-	vSub := Sub(NewLong(0), NewLong(1))
-	if vSub.Type != TypeLong || vSub.ToLong() != -1 {
-		t.Fatalf("Sub(0, 1) got %v (type %d), want -1", vSub.ToLong(), vSub.Type)
-	}
-
-	vMul := Mul(NewLong(-2), NewLong(-2))
-	if vMul.Type != TypeLong || vMul.ToLong() != 4 {
-		t.Fatalf("Mul(-2, -2) got %v (type %d), want 4", vMul.ToLong(), vMul.Type)
-	}
-
-	// 2. Negation of MinInt64 overflows to Double
-	vNegMin := Neg(NewLong(math.MinInt64))
-	if vNegMin.Type != TypeDouble || vNegMin.ToDouble() != -float64(math.MinInt64) {
-		t.Fatalf("Neg(MinInt64) got %v (type %d), want Double", vNegMin.ToDouble(), vNegMin.Type)
-	}
-
-	// 3. String leading int coercion
-	if NewString("12abc").ToLong() != 12 {
-		t.Fatalf("ToLong(\"12abc\") = %d, want 12", NewString("12abc").ToLong())
-	}
-	if NewString("3.14").ToLong() != 3 {
-		t.Fatalf("ToLong(\"3.14\") = %d, want 3", NewString("3.14").ToLong())
-	}
-	if NewString(" 42").ToLong() != 42 {
-		t.Fatalf("ToLong(\" 42\") = %d, want 42", NewString(" 42").ToLong())
-	}
-
-	// 4. Large 64-bit int exact comparison (no float64 precision loss)
-	a := NewLong(9007199254740993)
-	b := NewLong(9007199254740992)
-	if Equal(a, b) {
-		t.Fatalf("Equal(2^53+1, 2^53) should be false")
-	}
-
-	// 5. Compare(10, "foo") in PHP 8 compares as strings: "10" < "foo" -> -1
-	if Compare(NewLong(10), NewString("foo")) != -1 {
-		t.Fatalf("Compare(10, \"foo\") got %d, want -1", Compare(NewLong(10), NewString("foo")))
-	}
-
-	// 6. Concat zero-alloc
-	v1 := NewString("hello")
-	v2 := NewString("world")
-	var dst [128]byte
-	allocs := testing.AllocsPerRun(100, func() {
-		_ = Concat(v1, v2, dst[:])
-	})
-	if allocs != 0 {
-		t.Fatalf("Concat with preallocated buffer had %.2f allocs, want 0", allocs)
+func BenchmarkScalarOperations(b *testing.B) {
+	for _, c := range []struct {
+		name string
+		a, b Value
+	}{
+		{"integer", NewLong(7), NewLong(2)}, {"overflow", NewLong(math.MinInt64), NewLong(-1)},
+		{"double", NewDouble(1.75), NewDouble(-2.5)}, {"mixed", NewLong(7), NewDouble(2.5)},
+		{"conversion-modulo", NewDouble(1e30), NewDouble(3)}, {"nan", NewDouble(math.NaN()), NewDouble(1)},
+		{"division-zero", NewLong(1), NewLong(0)},
+	} {
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				scalarOperations(c.a, c.b)
+			}
+		})
 	}
 }

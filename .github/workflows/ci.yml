@@ -1,4 +1,4 @@
-name: php127 CI Gate & Torture Pipeline
+name: php127 CI & Parity Suite
 
 on:
   push:
@@ -7,37 +7,24 @@ on:
     branches: [ main, master ]
 
 jobs:
-  ci-gate:
-    name: Industrial CI Gate (7 Gates)
+  test:
+    name: Go 1.27 Test & Differential Parity Suite
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: [ '1.27.x' ]
-
     steps:
-      - name: Checkout php127 Code
+      - name: Checkout php127
         uses: actions/checkout@v4
 
-      - name: Checkout c2simd dependency
-        uses: actions/checkout@v4
-        with:
-          repository: hazyhaar/c2simd
-          path: .c2simd_checkout
-
-      - name: Set up Go
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: '1.27.x'
 
-      - name: Install System Dependencies & Setup Paths
+      - name: Install PHP CLI for Differential Oracle
         run: |
           sudo apt-get update
           sudo apt-get install -y php-cli
-          mkdir -p ../c2simd
-          cp -r .c2simd_checkout/c2pkg ../c2simd/
-          rm -rf .c2simd_checkout
 
-      - name: Execute 7-Gate CI Suite
+      - name: Build Standalone CLI & Verify Suites
         run: |
-          chmod +x ./scripts/ci_gate.sh
-          ./scripts/ci_gate.sh
+          go build -o /tmp/php127 ./cmd/php127
+          LC_ALL=C LANG=C go test -race -count=1 ./zone/... ./types/... ./lexer/... ./parser/... ./ast/... ./bytecode/... ./compiler/... ./stdlib/... ./vm/... ./sapi/... ./ext/... ./fiber/... ./filter/... ./datetime/... ./pdo/... ./reflection/... ./session/... ./spl/... ./streams/... ./cmd/...
