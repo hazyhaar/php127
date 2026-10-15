@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Micro-design for cybersafety — Article X</title>
+  <style>
+    :root {
+      --x-bg: #181a1e;
+      --x-border: #383c44;
+      --x-text: #e2e5e9;
+      --x-muted: #9ca3af;
+      --x-blue: #d2d6dc;
+      --col-w: 680px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--x-bg);
+      color: var(--x-text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 17px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .x-shell {
+      max-width: var(--col-w);
+      min-height: 100vh;
+      margin: 0 auto;
+      border-left: 1px solid var(--x-border);
+      border-right: 1px solid var(--x-border);
+      background-color: var(--x-bg);
+    }
+
+    .x-topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 53px;
+      padding: 0 16px;
+      background-color: rgba(0, 0, 0, 0.82);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--x-border);
+    }
+
+    .x-topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+    }
+
+    .x-back {
+      font-size: 20px;
+      color: var(--x-text);
+      text-decoration: none;
+      line-height: 1;
+    }
+
+    .x-topbar-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--x-text);
+    }
+
+    .x-topbar-right {
+      color: var(--x-text);
+      font-size: 18px;
+      opacity: 0.85;
+    }
+
+    .x-author {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px 12px;
+    }
+
+    .x-author-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .x-avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: #2f3336;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #8b98a5;
+      font-weight: 700;
+      font-size: 18px;
+    }
+
+    .x-author-meta {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.25;
+    }
+
+    .x-author-name {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--x-text);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .x-verified {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background-color: var(--x-blue);
+      color: #000;
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .x-author-handle {
+      font-size: 14px;
+      color: var(--x-muted);
+    }
+
+    .x-cover {
+      padding: 0 16px;
+      margin-bottom: 18px;
+    }
+
+    .x-cover img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 16px;
+      border: 1px solid var(--x-border);
+    }
+
+    .x-body {
+      padding: 0 16px 64px;
+    }
+
+    h1.x-title {
+      font-size: 32px;
+      font-weight: 800;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+      color: #ffffff;
+      margin-bottom: 16px;
+    }
+
+    .x-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 4px;
+      margin-bottom: 22px;
+      border-top: 1px solid var(--x-border);
+      border-bottom: 1px solid var(--x-border);
+      color: var(--x-muted);
+      font-size: 14px;
+    }
+
+    .x-action-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    h2 {
+      font-size: 23px;
+      font-weight: 800;
+      line-height: 1.3;
+      color: #ffffff;
+      margin: 32px 0 14px;
+    }
+
+    h3 {
+      font-size: 19px;
+      font-weight: 700;
+      line-height: 1.35;
+      color: #ffffff;
+      margin: 24px 0 10px;
+    }
+
+    p {
+      margin-bottom: 18px;
+      color: var(--x-text);
+      font-size: 17px;
+      line-height: 1.65;
+    }
+
+    strong {
+      color: #ffffff;
+      font-weight: 700;
+    }
+
+    em {
+      font-style: italic;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 14px;
+      background: #23272e;
+      padding: 2px 5px;
+      border-radius: 4px;
+      color: #e2e5e9;
+    }
+
+    ul, ol {
+      margin: 0 0 20px 22px;
+      color: var(--x-text);
+    }
+
+    li {
+      margin-bottom: 10px;
+      line-height: 1.62;
+    }
+
+    blockquote {
+      border-left: 3px solid var(--x-blue);
+      padding-left: 16px;
+      margin: 20px 0;
+      color: #d6d9db;
+      font-style: italic;
+    }
+
+    hr {
+      border: 0;
+      border-top: 1px solid var(--x-border);
+      margin: 28px 0;
+    }
+
+    figure.x-media {
+      margin: 20px 0 14px;
+    }
+
+    figure.x-media img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 14px;
+      border: 1px solid var(--x-border);
+    }
+
+    figure.x-media figcaption {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--x-muted);
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+
+<div class="x-shell">
+
+  <div class="x-topbar">
+    <div class="x-topbar-left">
+      <a class="x-back" href="#">&#8592;</a>
+      <span class="x-topbar-title">Article</span>
+    </div>
+    <div class="x-topbar-right">&#8599;</div>
+  </div>
+
+  <div class="x-author">
+    <div class="x-author-left">
+      <div class="x-avatar">H</div>
+      <div class="x-author-meta">
+        <div class="x-author-name">
+          hazylab <span class="x-verified">&#10003;</span>
+        </div>
+        <div class="x-author-handle">@hazyhaarlab</div>
+      </div>
+    </div>
+    <div style="color: var(--x-muted); font-size: 18px;">&bull;&bull;&bull;</div>
+  </div>
+
+  <div class="x-cover">
+    <img src="fig0_cover_en.png" alt="Micro-design for cybersafety — Cover">
+  </div>
+
+  <div class="x-body">
+
+    <h1 class="x-title">MICRO-DESIGN FOR CYBERSAFETY: How Clock-Cycle Optimization Locks Down PHP Security</h1>
+
+    <div class="x-actions">
+      <span class="x-action-item">&#128172; 12</span>
+      <span class="x-action-item">&#128257; 34</span>
+      <span class="x-action-item">&#9825; 148</span>
+      <span class="x-action-item">&#128202; 4.2K</span>
+      <span class="x-action-item">&#128278; &nbsp; &#8679;</span>
+    </div>
+
+    <h2>From a Language Anecdote to the Microarchitectural Rabbit Hole</h2>
+
+    <p>
+      Thrilled to see someone finally reimplement PHP from scratch, I wanted to take a shot at the adventure in Go. Once the bulk of the engine was up and running, it was time for the first benchmarks. I ran into the usual suspects and did my standard low-level engineering routine: eliminating the garbage collector from the hot path, packing values into CPU registers, freezing static metadata onto a perpetual read-only ribbon (<code>ARCHTIME</code>), and wiring mechanical SIMD kernels. But at the exact same time, I was discovering the inner workings of PHP itself. And it quickly became obvious that several micro-optimization patterns do much more than speed up execution&mdash;they can be directly weaponized to eradicate the native vulnerability classes of C, and of PHP.
+    </p>
+
+    <p>
+      What started as a classic systems-language benchmark&mdash;comparing the official C engine (<code>PHP 8.3.6</code>), a recent Rust reimplementation (<code>phpr</code>), and our Go 1.27 engine (<code>php127</code>, built on the <code>horos57</code> architecture) on a pinned Intel Core i9-14900K Golden Cove performance core&mdash;quickly turned the Go versus Rust comparison into a mere footnote that opened a much deeper rabbit hole.
+    </p>
+
+    <p>
+      When you open the processor's hardware performance counters (<code>perf_event_open</code> on <code>cpu_core</code>: retired instructions, CPU cycles, L1D and L3 cache accesses and misses, and Linux kernel minor page faults), a fundamental engineering law emerges: <strong>the exact micro-design choices required to achieve zero bytes of garbage-collector allocation per hot-loop iteration, 1,325 retired instructions (317 cycles) for VM entry and arena reset, and up to 5.73 retired instructions per clock cycle are the exact same structural invariants that eradicate the historical vulnerability classes of the C Zend Engine and the PHP ecosystem.</strong>
+    </p>
+
+    <hr>
+
+    <h2>The Global End-to-End Benchmark: PHP 8.3.6 (C) vs phpr (Rust) vs php127 (Go 1.27)</h2>
+
+    <p>
+      Before diving into microarchitectural internals, here is the high-level end-to-end picture (median wall-clock time in milliseconds and total retired CPU instructions across 11 runs, with 100% bit-exact Stdout parity) across the 8 foundational workload families of a PHP runtime, paired with our full-stack HTTP SAPI stress test (<strong>2,000 concurrent HTTP POST requests</strong> across 32 client goroutines executing transactional SQLite PDO, PCRE filtering, SHA-256 hashing, and JSON serialization at <strong>8,255 requests/second</strong> with a 3.84 ms median latency inside 16 recycled Zone arenas):
+    </p>
+
+    <figure class="x-media">
+      <img src="fig0b_global_bench_en.png" alt="End-to-End Global Benchmark: PHP 8.3.6 (C) vs phpr (Rust) vs php127 (Go)">
+      <figcaption>End-to-End Global Benchmark (Workloads 1 to 8, median over 11 runs) &mdash; Wall time (ms) and total retired instructions: PHP 8.3.6 (C CLI) vs phpr (Rust CLI) vs php127 CLI (Go) vs resident php127 VM.</figcaption>
+    </figure>
+
+    <hr>
+
+    <h2>The 6 Pillars of Micro-Design: 1 Visual Card and 1 Bullet per Mechanism</h2>
+
+    <p>
+      Instead of bolting on expensive software checks after the fact, every hardware bottleneck exposed by the processor counters was solved through a structural design invariant. Below, each of the six architectural mechanisms is presented as a four-quadrant visual card paired with an explanatory bullet.
+    </p>
+
+    <!-- Pillar 1 -->
+    <figure class="x-media">
+      <img src="fig_p1_en.png" alt="Pillar 1 — Pointer-Free 16-Byte Two-Register Values">
+    </figure>
+    <ul>
+      <li>
+        <strong>From raw C zval pointers to a 16-byte two-register Value</strong>: In the official C runtime, every PHP variable relies on a structure holding a raw memory pointer to a reference-counted allocation, exposing the engine to exploitable Type Confusion bugs. In php127, <code>types.Value</code> occupies exactly 16 bytes and fits inside two 64-bit CPU registers with zero memory pointers (<code>Type uint8</code>, <code>Flags uint8</code>, <code>Extra uint16</code>, <code>DataSlot uint32</code> indexing the request arena, and <code>Scalar uint64</code>). The Go compiler passes values in registers without ever triggering the Garbage Collector's write barrier, forging a raw memory pointer becomes physically impossible, and the untrusted-input marker bit (<code>FlagTainted</code>, set at the HTTP boundary by <code>insertParsedPair</code> / <code>newTaintedStr</code> in <code>sapi/url.go</code>) propagates across operations in registers right up to the <code>OpEval</code> and <code>OpInclude</code> sinks in <code>vm/source.go</code>.
+      </li>
+    </ul>
+
+    <!-- Pillar 2 -->
+    <figure class="x-media">
+      <img src="fig_p2_en.png" alt="Pillar 2 — Destructor Ordering and Zero-GC Lifecycle">
+    </figure>
+    <ul>
+      <li>
+        <strong>Eradicating Use-After-Free on destructors and achieving zero-GC execution</strong>: The number-one historical source of critical vulnerabilities in the PHP interpreter occurs when a userland destructor (<code>__destruct()</code>) triggers mid-mutation or during frame teardown, freeing or reallocating the container while the engine still holds a stale reference. In php127, the new value is always committed into its target slot before <code>ReleaseValue</code>, <code>vm.slots</code> is re-anchored after any call that may grow the stack, and the <code>-tags vmcheck</code> build-tag runtime guard (<code>checkSlotsAfterPop</code>) verifies at every <code>popFrame()</code> that no residual non-<code>TypeUndef</code> slot remains above the stack top. On the baseline <code>D0_Noop</code> probe, stratum F4 (<code>VM Execute + Zone.Reset</code>) retires 1,325 instructions (317 cycles, 0.07 microseconds) with 0 bytes allocated on the Go heap.
+      </li>
+    </ul>
+
+    <figure class="x-media">
+      <img src="fig2_matrice_f_d_zero_gc.png" alt="Stratified F x D Matrix: Isolation of Strata F1 to F4">
+      <figcaption>Stratified F &times; D Matrix (F1 to F4 across D0_Noop to D4_ObjRegex) &mdash; Compilation (F1 to F3) is paid once at ARCHTIME; per-request execution (F4) runs inside the Zone arena.</figcaption>
+    </figure>
+
+    <!-- Pillar 3 -->
+    <figure class="x-media">
+      <img src="fig_p3_en.png" alt="Pillar 3 — In-Place Array Mutation and L1d Arena Recycling">
+    </figure>
+    <ul>
+      <li>
+        <strong>In-place array mutation (FlagAssignDimCV) and isolated arena costs (Zone.Alloc vs Zone.Reset)</strong>: Instead of defensively cloning associative arrays on <code>$h[$k] = $v</code> or exposing C allocator metadata to Heap Feng Shui exploitation, the <code>FlagAssignDimCV</code> fast path updates the bucket in place whenever <code>RefCount</code> is 1, while freed temporary strings are immediately recycled at the head of the arena freelist (<code>z.freeHead</code>) in L1d cache. Dedicated micro-probes separate both primitives: an amortized <code>Zone.Alloc(64B)</code> retires 40 instructions (6 cycles, 1.26 ns), while an object-free <code>Zone.Reset()</code> retires 195 instructions in differential M0&Delta; (52 cycles, 10.00 ns; 235 instructions and 58 cycles in full M0b) by resetting the byte cursor (<code>z.offset = 0</code>, <code>z.freeHead = 0</code>) in O(1) constant time and clearing the request's allocated object slice in O(objectUsed).
+      </li>
+    </ul>
+
+    <!-- Pillar 4 -->
+    <figure class="x-media">
+      <img src="fig_p4_en.png" alt="Pillar 4 — ARCHTIME Freezing and Per-VM Inline Caches">
+    </figure>
+    <ul>
+      <li>
+        <strong>Perpetual frozen ribbon at ARCHTIME (ResolvedProps) and inline caches active in {main}</strong>: Superglobal slots (<code>SuperglobalCVs</code>) and flattened class property tables (<code>ResolvedProps</code> in <code>bytecode/program.go</code>) are resolved and sealed once at link time (<code>bytecode.Link</code>). Assigning <code>FuncID = 1</code> to the root <code>{main}</code> OpArray activates per-VM monomorphic <code>propCaches</code> and <code>callCaches</code> at the top level of every script: across the 100,100 iterations of <code>5_ObjPropMut</code>, enabling inline caches in <code>{main}</code> cuts retired VM instructions by 3.7x (from 27,424 down to 7,410 instructions per iteration), with zero cross-goroutine data races (<code>-race</code> clean).
+      </li>
+    </ul>
+
+    <!-- Pillar 5 -->
+    <figure class="x-media">
+      <img src="fig_p5_en.png" alt="Pillar 5 — Fused Super-Instructions and Stack Verification">
+    </figure>
+    <ul>
+      <li>
+        <strong>Fused super-instructions (TypeLong and TypeDouble) and static MaxStack verification</strong>: To reduce switch-loop dispatch overhead in <code>execFrames</code> without multiplying indirect jump targets vulnerable to Spectre-BTB, the inner loop fuses common 3-to-4-opcode sequences (<code>OpLoadCV</code> + <code>OpAdd</code>/<code>OpSub</code>/<code>OpMul</code>/<code>OpIsSmaller</code> + <code>OpStoreCV</code>/<code>OpJmpZ</code>) for both 64-bit integers (<code>TypeLong</code>) and IEEE-754 floats (<code>TypeDouble</code>). Across the 50,100 iterations of the Julia orbit benchmark (<code>11_W_RustFloat</code>), extending super-instructions to <code>TypeDouble</code> cuts the differential VM cost from 9,874 down to 4,288 instructions per iteration (3.09x fewer instructions than the 13,263 instructions retired by <code>phpr</code> in Rust). On <code>13_B_GoSwiBTB</code> (20,100 iterations), the Go VM retires 56.79 million instructions (2.50 ms, IPC 5.20, 0.00% branch misses) versus 126.15 million for the C binary (5.42 ms).
+      </li>
+    </ul>
+
+    <!-- Pillar 6 -->
+    <figure class="x-media">
+      <img src="fig_p6_en.png" alt="Pillar 6 — sgoiter Mechanically Transpiled AVX2 Kernels">
+    </figure>
+    <ul>
+      <li>
+        <strong>Mechanical C99 to Go AVX2 transpilation via sgoiter</strong>: Zero lines of vector assembly are written or tweaked by hand. Both <code>c2_strpos_avx2</code> and <code>php_scan_block_comment_avx2</code> are authored in C99, verified against <code>gcc -O2</code>, and mechanically transpiled by <code>sgoiter</code> to Go 1.27 <code>simd/archsimd</code> with strict rejection of unterminated block comments. On <code>9_W_GoSimdPos</code> (5,050 iterations over a 1,290-byte haystack), the Go VM retires 85.33 million instructions (16,893 instructions/op in delta) versus 147.57 million instructions for the C CLI process (9,722 instructions/op in delta) and 1,495.30 million instructions for <code>phpr</code> in Rust (178,434 instructions/op in delta, i.e., 10.56x fewer instructions in Go VM than in Rust).
+      </li>
+    </ul>
+
+    <hr>
+
+    <h2>Kernel-Max Core Benchmarks (Tests 1 to 8): End-to-End Total vs Marginal Delta</h2>
+
+    <p>
+      For an honest engineering reading, two distinct execution regimes must be separated: first, the three CLI columns (<code>PHP 8.3.6 C</code>, <code>phpr Rust</code>, <code>php127 CLI Go</code>) which measure a complete standalone subprocess (<code>fork + execve</code>, dynamic linking, lexing, parsing, compilation, and execution of HighN); second, the <code>php127 VM (In-Process)</code> column which measures execution of the pre-compiled (<code>ARCHTIME</code>) program inside a resident Go worker followed by <code>Zone.Reset()</code>, along with the differential delta <code>&Delta; = (Run(HighN) - Run(LowN)) / &Delta;N</code> which isolates the pure marginal per-iteration cost stripped of process startup and compilation (0 bytes allocated on the Go heap per loop iteration on workloads 1 to 5, with the outer <code>Execute</code> call envelope accounting for 96&ndash;112 bytes).
+    </p>
+
+    <figure class="x-media">
+      <img src="fig3a_en_core_1_4.png" alt="Kernel-Max Benchmarks Part 1/2: Tests 1 to 4">
+      <figcaption>Part 1/2 (Tests 1 to 4, median over 11 runs) &mdash; Go CLI beats C CLI on 1_ColdBoot (41.39M vs 98.23M instructions; 2.51 ms vs 5.97 ms) and on 2_LoopBranch wall time (4.38 ms vs 5.87 ms). In pure marginal delta (&Delta; insn/op), C leads on tight loops (149 insn/op on 2_LoopBranch, 914 on 3_IntArithBit, 1,285 on 4_FuncCalls).</figcaption>
+    </figure>
+
+    <figure class="x-media">
+      <img src="fig3b_en_core_5_8.png" alt="Kernel-Max Benchmarks Part 2/2: Tests 5 to 8">
+      <figcaption>Part 2/2 (Tests 5 to 8, median over 11 runs) &mdash; PropIC active in {main} on 5_ObjPropMut (7,410 insn/op in VM vs 9,229 in Rust); Go CLI beats C CLI in wall time on 7_HashArrayMut (4.71 ms vs 5.43 ms); Go VM retires fewer total instructions than the C CLI process on 6_StrArenaVsRc (144.20M vs 181.10M), 7_HashArrayMut (20.58M vs 104.02M), and 8_RegexPCRE (38.18M vs 109.84M).</figcaption>
+    </figure>
+
+    <hr>
+
+    <h2>White &amp; Black Probes (Tests 9 to 15): Strengths and Friction Points</h2>
+
+    <p>
+      Seven additional probes target the architectural strengths of each engine (white probes 9 to 11) and the microarchitectural friction points of Go and Rust (black probes 12 to 15), reporting exact HighN iteration counts.
+    </p>
+
+    <figure class="x-media">
+      <img src="fig4a_en_white_9_11.png" alt="White Probes 9 to 11">
+      <figcaption>White Probes (Tests 9 to 11) &mdash; 9_W_GoSimdPos (HighN=5,050, 1,290-byte buffer: 85.33M insn in Go VM, &Delta; 16,893 insn/op vs 178,434 in Rust), 10_W_GoZoneObj (HighN=5,050), and 11_W_RustFloat (HighN=50,100: float64 super-instructions at 4,288 insn/op in Go VM vs 13,263 in Rust and 1,806 in C).</figcaption>
+    </figure>
+
+    <figure class="x-media">
+      <img src="fig4b_en_black_12_15.png" alt="Black Probes 12 to 15">
+      <figcaption>Black Probes (Tests 12 to 15) &mdash; 12_B_GoStrFree (HighN=10,100), 13_B_GoSwiBTB (HighN=20,100: 56.79M insn and 2.50 ms in Go VM vs 126.15M and 5.42 ms in C), 14_B_GoDeepRec (HighN=1,010: in pure delta C retires 35,987 insn/op vs 72,987 in Go VM and 171,512 in Rust), and 15_B_RustCowDrp (HighN=2,010).</figcaption>
+    </figure>
+
+    <hr>
+
+    <h2>What an Honest Comparison Between C, Rust, and Go 1.27 Shows</h2>
+
+    <p>
+      Cross-referencing end-to-end totals (Part 1) with marginal per-iteration deltas (Part 2) yields a clear, unvarnished engineering diagnosis:
+    </p>
+
+    <ul>
+      <li>
+        <strong>Why the C engine (PHP 8.3.6) leads in pure marginal delta (&Delta; insn/op) on long loops</strong>: The C Zend Engine dispatches opcodes via assembly indirect jumps (computed goto) and mutates raw pointers without bounds checks. In pure per-iteration work (Part 2), it retires 2.0x to 4.8x fewer instructions than php127 VM across arithmetic, object, and array loops (149 vs 355 insn/op on 2_LoopBranch, 1,534 vs 7,410 on 5_ObjPropMut, 35,987 vs 72,987 on deep recursion 14_B_GoDeepRec).
+      </li>
+      <li>
+        <strong>Why php127 CLI beats php 8.3 CLI in wall time on 4 short-to-medium workloads (1_ColdBoot, 2_LoopBranch, 7_HashArrayMut, 15_B_RustCowDrp)</strong>: Every standalone <code>php -n</code> invocation pays roughly 98 million instructions and 1,100 minor page faults in dynamic linking and runtime initialization. The self-contained Go binary php127 CLI pays only 41.39 million instructions and 894 page faults on startup (2.51 ms vs 5.97 ms on 1_ColdBoot, 4.38 ms vs 5.87 ms on 2_LoopBranch, 4.71 ms vs 5.43 ms on 7_HashArrayMut, and 4.42 ms vs 4.57 ms on 15_B_RustCowDrp).
+      </li>
+      <li>
+        <strong>Why resident php127 VM beats the C subprocess in wall time and total instructions on 10 of 15 workloads (1, 2, 6, 7, 8, 9, 10, 12, 13, 15)</strong>: By keeping the ARCHTIME-frozen <code>*bytecode.Program</code> in memory and running each HTTP request inside a Zone whose byte cursor is reset in 195 instructions (<code>Zone.Reset()</code>), the engine eliminates the ~98M <code>execve</code> instructions, the 1,100 kernel page faults, and per-request script recompilation.
+      </li>
+      <li>
+        <strong>Why php127 VM retires 1.25x to 10.56x fewer instructions per mutation than phpr (Rust) across all 14 iterative workloads</strong>: From 5_ObjPropMut (7,410 vs 9,229 insn/op, 1.25x), 15_B_RustCowDrp (16,647 vs 23,312, 1.40x), and 7_HashArrayMut (10,225 vs 15,916, 1.56x) up to 11_W_RustFloat (4,288 vs 13,263, 3.09x) and 9_W_GoSimdPos (16,893 vs 178,434, 10.56x), decoupling 16-byte pointer-free values from the request-indexed arena avoids defensive cloning and per-value <code>Rc::clone</code> / <code>Drop</code> cascades.
+      </li>
+    </ul>
+
+    <figure class="x-media">
+      <img src="fig5_en_energy_web.png" alt="Architectural Synthesis: CLI Subprocess vs Resident Virtual Machine">
+      <figcaption>Architectural Synthesis: CLI Subprocess (execve + page faults) vs Resident Virtual Machine (ARCHTIME + 195-instruction Zone.Reset).</figcaption>
+    </figure>
+
+    <hr>
+
+    <h2>Hardware Taint Tracking (FlagTainted) and Deterministic Observability</h2>
+
+    <p>
+      The final takeaway of this exploration concerns production runtime security. In a traditional C PHP deployment, tracking untrusted user inputs or inspecting sensitive sinks requires heavy external hooks.
+    </p>
+
+    <figure class="x-media">
+      <img src="fig6_en_c2blue55_secu.png" alt="FlagTainted Chain and Deterministic Observability">
+      <figcaption>End-to-end FlagTainted chain (from sapi/url.go to OpEval/OpInclude sinks in vm/source.go) and deterministic observability.</figcaption>
+    </figure>
+
+    <p>
+      In php127, runtime safety is enforced directly by virtual-machine invariants:
+    </p>
+
+    <ul>
+      <li>
+        <strong>HTTP source marking (sapi/url.go) and propagation inside the 16-byte types.Value</strong>: Every string decoded from HTTP parameters (<code>insertParsedPair</code> / <code>newTaintedStr</code> in <code>sapi/url.go</code> and <code>sapi/errors.go</code>) receives the <code>types.FlagTainted</code> bit inside the <code>Flags</code> byte of its 16-byte <code>Value</code>. String concatenations (<code>types.Concat</code>, <code>types.ConcatStringLong</code>), interpolations, and slice operations propagate this bit via a bitwise <code>OR</code> in registers.
+      </li>
+      <li>
+        <strong>Sink circuit-breaker (OpEval and OpInclude in vm/source.go)</strong>: Whenever a <code>Value</code> carrying <code>FlagTainted</code> reaches <code>opSource</code> (<code>OpEval</code> or <code>OpInclude</code>), the virtual machine increments the per-request counter <code>Context.TaintedSinks</code> and, when <code>Context.BlockTaintedSinks</code> is enabled, immediately aborts the instruction with a <code>ValueError</code> (<code>"Tainted input rejected at ..."</code>) before any parsing or execution of the injected payload.
+      </li>
+      <li>
+        <strong>Closed execution graph (bytecode.Verify) and build-tag runtime stack invariant guard (-tags vmcheck)</strong>: Every <code>OpArray</code> is statically verified ahead of execution (<code>MaxStack</code>, compiled variable indices <code>NumCVs</code>, jump targets), and <code>checkSlotsAfterPop</code> (<code>-tags vmcheck</code>) verifies operand stack integrity on every frame return.
+      </li>
+    </ul>
+
+    <hr>
+
+    <h2>Conclusion: Practical Guide to Security and Observability in php127</h2>
+
+    <p>
+      Beyond the head-to-head measurements across C, Rust, and Go 1.27, this architecture delivers two operational pillars directly usable when running PHP workloads: <strong>structural security additions</strong> to the language runtime and <strong>deterministic observability</strong> (both application-level and hardware-level). Here is what engineers and integrators need to know to use them.
+    </p>
+
+    <h3>1. Security Additions to PHP: What php127 Guarantees and How to Use It</h3>
+
+    <p>
+      Security management in php127 is split into <strong>structural invariants enabled by default</strong> (protecting every PHP script with zero code changes) and <strong>configurable policy guards</strong> (taint tracking and SAPI confinement).
+    </p>
+
+    <ul>
+      <li>
+        <strong>Default Structural Guarantees (Zero Configuration Required)</strong>:
+        <br>1. <em>Elimination of Type Confusion and Pointer Corruption (types/value.go)</em>: Unlike the C <code>zval</code> (which stores raw C pointers inside an untagged C union), <code>types.Value</code> is a purely numerical 16-byte struct (<code>Type</code>, <code>Flags</code>, <code>Extra</code>, <code>DataSlot uint32</code>, <code>Scalar uint64</code>). A logic bug can never forge an arbitrary memory address.
+        <br>2. <em>Elimination of Destructor Reentrancy Use-After-Free (vm/value.go, vm/array.go)</em>: Whenever an assignment overwrites a compiled variable (<code>writeCV</code>, <code>storeCVMove</code>) or an array bucket (<code>ArraySet</code>) holding an object with a <code>__destruct()</code> method, php127 writes the new value into the slot <strong>before</strong> invoking <code>ReleaseValue</code> on the old value.
+        <br>3. <em>Cross-Request Memory Isolation and O(1) Epoch Validation (zone/zone.go)</em>: Every request runs inside its own <code>Zone</code>. Every <code>DataSlot</code> dereference checks that the arena epoch (<code>z.epoch</code>) and <code>FlagZoneRequest</code> match; when the request ends, <code>Zone.Reset()</code> increments the epoch and resets the byte cursor to zero in 195 instructions, making cross-request memory leaks structurally impossible.
+        <br>4. <em>Ahead-of-Time Static Bytecode Verification (bytecode/verify.go)</em>: Every compiled or loaded <code>OpArray</code> passes through <code>bytecode.Verify</code>, which validates jump bounds, compiled variable indices (<code>NumCVs</code>), constant indices, and maximum stack depth (<code>MaxStack</code>) before <code>vm.Execute</code> runs its first instruction.
+        <br>5. <em>Per-Request Fault Containment (vm/vm.go, sapi/server.go)</em>: Both <code>vm.Execute</code> and <code>sapi.Server.ServeHTTP</code> enforce a containment <code>recover()</code> boundary that turns any unexpected internal fault into a controlled exit (exit code <code>255</code> in CLI or HTTP <code>500</code> on the offending request alone) without ever crashing the resident server process.
+      </li>
+      <li>
+        <strong>How to Configure and Use Taint Tracking (FlagTainted) and the SAPI Server</strong>:
+        <br>&bull; <em>Automatic HTTP Source Marking</em>: When a request enters through <code>sapi.Server</code> (or <code>sapi.PopulateSuperglobals</code>), <code>insertParsedPair</code> (<code>sapi/url.go</code>) automatically stamps every key and value in <code>$_GET</code>, <code>$_POST</code>, <code>$_COOKIE</code>, and <code>$_REQUEST</code> with <code>types.FlagTainted</code>. This bit propagates automatically across string concatenations (<code>.</code> / <code>ConcatStringLong</code>), interpolations, and slice operations (<code>substr</code>, <code>trim</code>).
+        <br>&bull; <em>Shadow Audit Mode (Counting Only) vs Circuit-Breaker Mode (Active Blocking)</em>: Operators control enforcement through <code>vm.Context</code> by setting <code>ctx := &amp;vm.Context{BlockTaintedSinks: true}</code> on the VM instance. If any input derived from <code>$_GET</code>/<code>$_POST</code> reaches <code>eval()</code> or <code>include</code>, <code>ctx.TaintedSinks</code> is incremented and, when <code>BlockTaintedSinks</code> is <code>true</code>, execution immediately aborts with a <code>ValueError ("Tainted input rejected at eval")</code>.
+        <br>&bull; <em>Deploying the Pooled Resident HTTP Server</em>: <code>sapi.NewServer(sapi.Config{Program: prog, MaxWorkers: 16, ZoneCapacity: 4 &lt;&lt; 20})</code> shares the ARCHTIME-frozen bytecode across 16 workers and recycles 4 MiB request arenas via <code>Zone.Reset()</code>.
+        <br>&bull; <em>Enabling the Runtime Stack Invariant Guard</em>: <code>go test -tags vmcheck -race -count=1 ./vm/... ./compiler/... ./sapi/...</code> activates <code>checkSlotsAfterPop</code> on every frame return.
+      </li>
+    </ul>
+
+    <h3>2. Application and Hardware Observability: What It Does and How to Use It</h3>
+
+    <p>
+      Observability in php127 is built into the repository at two exact measurement layers: <strong>SAPI/VM operational counters</strong> for production and <strong>the probebench Linux PMU hardware harness</strong> for microarchitectural qualification.
+    </p>
+
+    <ul>
+      <li>
+        <strong>What Observability Measures</strong>:
+        <br>1. <em>Application and SAPI Layer (sapi.Server, vm.Context, zone.Zone)</em>: <code>srv.RequestsHandled()</code> and <code>srv.ZonesCreated()</code> verify in real time that 100% of HTTP traffic is served by the fixed pool of preallocated arenas (<code>ZonesCreated() &lt;= MaxWorkers</code>), proving zero arena leaks under load. <code>ctx.TaintedSinks</code> reports at the end of every request the exact number of times HTTP-tainted data (<code>FlagTainted</code>) reached an execution sink (<code>OpEval</code>, <code>OpInclude</code>, <code>OpRequire</code>), even in non-blocking shadow-audit mode (<code>BlockTaintedSinks: false</code>).
+        <br>2. <em>Microarchitectural and Energy Layer (probebench/pmu_linux.go)</em>: drives the Linux <code>perf_event_open</code> syscall directly on pinned P-core 0 (<code>sched_setaffinity</code>) and reads 6 hardware counters simultaneously (<code>CyclesUser</code>, <code>Instructions</code>, <code>L1DMisses</code>, <code>LLCMisses</code>, <code>BranchMisses</code>, <code>MinFlt</code>), proves zero PMU multiplexing via <code>PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING</code> (<code>Multiplexed == false</code>), reads Intel RAPL hardware energy in microjoules (<code>energy_uj</code>), and isolates marginal per-iteration cost via differential sizing <code>HighN - LowN</code>.
+      </li>
+      <li>
+        <strong>How to Use It from CLI and Go</strong>:
+        <br>&bull; <em>Atomic mechanism probes (M0a..M6)</em>: <code>go test -v -count=1 -run TestAtomicMicroProbes ./probebench/...</code>
+        <br>&bull; <em>2D Stratified Function &times; Data-Size Matrix (F0..F5 &times; D0..D4)</em>: <code>go test -v -count=1 -run TestStratifiedFunctionAndDataMatrix ./probebench/...</code>
+        <br>&bull; <em>Full 15-workload comparative suite (C vs Rust vs Go CLI vs Go VM, read-only mode)</em>: <code>go test -v -count=1 -run TestKernelProbeGoVsRustVsC ./probebench/...</code> (pass <code>PROBEBENCH_UPDATE_METRICS=1</code> to update <code>probebench/testdata/latest_metrics.json</code>).
+        <br>&bull; <em>Direct Go API in custom tests</em>: <code>metrics, err := probebench.MeasureInProcess(11, true, func() error { ... })</code> returns the 11-run median with instructions, cycles, IPC, L1D/LLC cache misses, RAPL energy, and non-multiplexing proof.
+      </li>
+    </ul>
+
+  </div>
+
+</div>
+
+</body>
+</html>
